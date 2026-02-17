@@ -1,0 +1,32 @@
+# --- CORE WEB & API ---
+fastapi==0.115.0
+uvicorn==0.30.6
+httptools==0.7.1
+uvloop==0.22.1
+pydantic>=2.9.0,<3.0.0
+python-dotenv==1.0.1
+requests==2.32.3
+
+# --- AZURE STACK ---
+azure-core==1.30.2
+azure-search-documents==11.6.0
+azure-servicebus==7.12.2
+azure-storage-blob==12.22.0
+
+# --- LANGCHAIN & AI PROVIDERS ---
+langchain>=0.3.0
+langchain-core>=0.3.61,<0.4.0
+langchain-openai>=0.3.0
+langchain-google-genai>=1.0.0,<3.0.0
+openai>=1.60.0
+
+# --- LANGGRAPH ---
+langgraph>=0.2.0
+langgraph-checkpoint>=2.0.0
+langgraph-checkpoint-sqlite>=2.0.0
+aiosqlite==0.22.1
+
+# --- UTILS ---
+python-multipart==0.0.9
+SQLAlchemy==2.0.36
+tiktoken>=0.8.0
