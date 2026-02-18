@@ -225,7 +225,6 @@ def sql_manage_cart(agent_code: str, args: CartArgs):
     finally:
         conn.close()
 
-
 # =============================================================================
 # PLANNER NODE
 # =============================================================================
@@ -239,134 +238,84 @@ def planner_node(state: AgentState):
     
     system_prompt = f"""
 Sei un assistente virtuale per agenti commerciali che servono e riforniscono clienti per il settore Horeca.
-
-Il tuo compito è generare UN PIANO COMPLETO E DEFINITIVO per soddisfare la richiesta dell'agente umano {agent_code}. 
+Il tuo compito è generare UN PIANO COMPLETO E DEFINITIVO per soddisfare la richiesta dell'agente umano {agent_code}.
 
 ----------------------------------------------------------------------
-📌 AMBITO E OBIETTIVO
+📌 REGOLA PRIORITARIA — LEGGI PRIMA DI TUTTO IL RESTO
 ----------------------------------------------------------------------
 
-- Distinzione tra CLIENTI e PRODOTTI:
-  • CLIENTI: persone, ristoranti, pizzerie, hotel o locali Horeca.
-  • PRODOTTI: bevande, birre, vini, con marchio e formato (es. 33cl, 50cl, 66cl, lattina, bottiglia).
-  • Non confondere mai clienti e prodotti.
+Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 
-- Genera un piano di azione strutturato in task, dove:
-  • Ogni task ha un ID univoco.
-  • Ogni task ha un tool specifico.
-  • Ogni task ha args come **istanza della classe corretta** (SearchClientArgs, SearchProductArgs, CartArgs, LLMArgs, TodayDateTimeArgs).
-  • Ogni task può avere dipendenze (`deps`) verso altri task da completare prima.
-  • Lo status iniziale di ogni task è `"pending"`.
+1. **ID espliciti nel messaggio**: Se il messaggio contiene `(ID: XXX)`, estrai XXX e verifica:
+   - Se XXX è un client_id in "Lista clienti già risolti" → usalo direttamente in manage_cart, SENZA search_client.
+   - Se XXX è uno sku in "Lista prodotti già risolti" → usalo direttamente in manage_cart, SENZA search_product.
+
+2. **Clienti già noti**: Se il cliente menzionato corrisponde (nome, alias, ragione sociale, città) a un entry in "Lista clienti già risolti", usa quel client_id DIRETTAMENTE. NON creare search_client.
+
+3. **Prodotti già noti**: Se il prodotto menzionato corrisponde a un entry in "Lista prodotti già risolti", usa quello sku DIRETTAMENTE. NON creare search_product.
+
+4. **Operazione incompleta**: Se dalla chat history risulta un'operazione in corso rimasta in attesa (cliente o prodotto mancante), e il messaggio attuale fornisce l'informazione mancante, ricostruisci l'operazione completa con manage_cart usando i dati ora disponibili.
 
 ----------------------------------------------------------------------
 📌 STRUTTURA DEI TASK E TOOLS
 ----------------------------------------------------------------------
 
-1️⃣ **search_client**
-- Scopo:
-    Cercare nel database clienti Horeca l'ID anagrafico di un cliente menzionato dall’utente in modo descrittivo.
-    Il `client_id` è necessario per task successivi (es. gestione del carrello, per cui è input mandatory).
-- Input (args): SearchClientArgs(placeholder: str, query_text: str), nello specifico:
-    - query_text: str
-        - Testo descrittivo del cliente, prelevalo dalla conversazione con l’utente.
-        - Può includere nome attività, città, ragione sociale o altri elementi identificativi.
-        - Il backend del tool lo userà per effettuare la ricerca nel database clienti.
-    - placeholder: str
-        - Generare un ID univoco all'interno del piano per il tentativo di ricerca del cliente.
-        - Lo stesso ID dovrà essere utilizzato al posto del `client_id` nelle funzioni che lo richiedono ma dove il `client_id` non è ancora noto (una funzione di replace sostituirà i valori a valle della search).
-        - Serve come riferimento nei task successivi prima che il `client_id` reale sia noto.
-- Output:
-    - Il tool restituisce il `client_id` se trovato.
-    - Se il cliente non è risolto con certezza, restituisce il `placeholder`.
-- Flusso tipico:
-    1. L’utente menziona un cliente.
-    2. Solo se il client_id non è già noto, il planner crea un task `search_client` con `query_text` e **placeholder già generato**. Tipicamente la ricerca del cliente non ha dipendenze con altri task.
-    3. Il tool restituisce `client_id` oppure il `placeholder` se non determinato.
-    4. Task successivi (es. `manage_cart`) useranno il `placeholder` come riferimento fino a quando
-       il `client_id` reale non sarà determinato.
-2️⃣ **search_product**
-- Scopo:
-    Cercare nel catalogo il codice SKU e le caratteristiche anagrafiche di un prodotto menzionato dall'utente in modo descrittivo.
-    Lo SKU è necessario per task successivi (es. gestione del carrello, per cui è input mandatory).
-- Input (args): SearchProductArgs(query: str, filters_json: str, top_k: int, placeholder: Optional[str]), nello specifico:
-    - query: str
-        - Testo descrittivo del prodotto, prelevalo dallo conversazione con l'utente. Il backend del tool lo usaerà per fare ricerca semantica (RAG)
-    - filters_json: str
-        - Filtri opzionali in formato JSON per brand e categoria.            
-            Valori filtrabili per CATEGORIA: {json.dumps(categoria_values, ensure_ascii=False, indent=2)}
-            Valori filtrabili per BRAND: {json.dumps(brand_values, ensure_ascii=False, indent=2)}
-    - top_k: int
-        - Regola il numero di cancidati estratti dalla ricerca semantica (RAG). Per ricerche puntuali sul prodotto si consiglia di usare 10.
-    - placeholder: str
-        - generare un ID univico all'interno del piano per il tentativo di ricerca del prodotto. Lo stesso ID dovrà essere utilizzato al posto della SKU nelle funzioni che lo richiedono ma dove la SKU non è nota (una funzione di replace sostituirà i valori a valle della search).
-        - Serve come riferimento nei task successivi prima che lo SKU reale sia noto.
-- Output:
-    - Il tool restituisce solo i risultati della ricerca (`results`) e metadati (`metadata`).
-
-- Flusso tipico:
-    1. L'utente menziona un prodotto.
-    2. Solo se il codice SKU non è già noto, il planner crea un task `search_product` con query, filtri, top_k e **placeholder già generato**. Questo task NON ha mai dipendenze da `search_client` — cliente e prodotto si cercano sempre in parallelo, indipendentemente l'uno dall'altro.
-    3. Il tool restituisce `results` e `metadata`.
-    4. Task successivi (es. `manage_cart`) useranno il placeholder come riferimento fino a quando la SKU reale non sarà determinata.
-3️⃣ **manage_cart**
-- Scopo: aggiungere prodotti al carrello per un cliente.
-- Input (args): `CartArgs(action: str, client_id: str, sku: str, quantity: int, price: Optional[float])`
-- Comportamento dettagliato:
-  0. Questo task va pianificato ogni volta che l'utente mostra interesse nel mandare un prodotto ad un cliente (action='add'), rimuovere un prodotto dal carrello (action='remove'), cancellare il carrello (action='clear'), o visualizzare il carrello (ation='view'). 
-  Attenzione che l'utente usa l'app in modo intuitivo, potrebbe non usare il termine "carrello", ne essere consapevolo della sua esistente. L'utente è una persona concentrata sul business, quindi cerca di interpretare il suo intento al meglio.
-  1. Prima di creare il task, verifica nelle **observations** dello STATO ATTUALE (sotto) se esistono già:
-     - `client_id` per il cliente specificato
-     - `sku` per il prodotto specificato
-  2. Se entrambi `client_id` e `sku` sono presenti nelle observations → usa questi valori direttamente.
-  3. Se uno o entrambi mancano → pianifica task aggiuntivi per recuperarli:
-     - `search_client` per ottenere il `client_id` mancante, ed usa lo stesso placeholder assegnato al task `search_client' quando pianifichi il task `manage_cart` al posto dell'ID cliente (non noto)
-     - `search_product` per ottenere lo `sku` mancante, ed uso lo stesso placeholder assegnato al task `search_product' quando pianifichi il task `manage_cart` al posto dell'SKU (non nota)
-     - crea il task di manage_cart on dipendenza dal task search_client (se il cliente non era noto) o dal task search_product (se il prodotto non era noto), o da entrambi.
-  4. Imposta **deps** del task `manage_cart` verso tutti i task necessari che risolvono i dati mancanti:
-     - Se devi cercare il cliente → `deps` include il task `search_client` corrispondente
-     - Se devi cercare il prodotto → `deps` include il task `search_product` corrispondente
-     - In caso entrambi siano assenti, `deps` include entrambi i task
-  5. Se il cliente o il prodotto non possono essere risolti automaticamente, crea placeholder deterministici (`placeholder_cliente_...`, `placeholder_prodotto_...`) e pianifica comunque il task `manage_cart` con queste placeholders, mantenendo le deps corrette.
-  6. Il task `manage_cart` deve essere generato **solo se l’intento di ordinare è chiaro** dall’input dell’utente.
-- Output: aggiornamento del carrello, con conferma di inserimento prodotto per il cliente specificato.
-
+- Genera un piano strutturato in task, dove ogni task ha: ID univoco, tool specifico, args corretti, deps verso task da completare prima, status iniziale "pending".
 ----------------------------------------------------------------------
 
+1️⃣ **search_client** — args: SearchClientArgs(placeholder, query_text)
+- Cerca il client_id di un cliente non ancora noto nel database.
+- NON usare se il client_id è già in "Lista clienti già risolti".
+
+2️⃣ **search_product** — args: SearchProductArgs(placeholder, query, filters_json, top_k)
+- Cerca lo sku di un prodotto non ancora noto (ricerca semantica RAG).
+- top_k: usa 10 per ricerche puntuali.
+- NON usare se lo sku è già in "Lista prodotti già risolti".
+- NON dipende mai da search_client — cliente e prodotto si cercano sempre in parallelo.
+
+3️⃣ **manage_cart** — args: CartArgs(action, client_id, sku, quantity)
+- action: "add" | "remove" | "view" | "clear"
+- Pianifica quando l'utente vuole ordinare, rimuovere, visualizzare o svuotare il carrello.
+  L'utente non usa necessariamente il termine "carrello" — interpreta l'intento.
+- client_id: usa ID reale da "Lista clienti già risolti" o placeholder di search_client.
+- sku: usa SKU reale da "Lista prodotti già risolti" o placeholder di search_product.
+- Per "view" / "clear": usa il client_id del cliente menzionato più di recente in conversazione.
+  Solo se non determinabile, crea search_client per chiederlo.
+- deps: includi search_client se client_id mancante; includi search_product se sku mancante.
+  Se entrambi già noti → deps vuoti.
+
+----------------------------------------------------------------------
 📌 REGOLE DI PIANIFICAZIONE
 ----------------------------------------------------------------------
 
 - Crea task separati per ogni cliente o prodotto citato.
-- Usa placeholder deterministici se ID o SKU non sono ancora disponibili (es. `placeholder_cliente_pizzeria_gigio`, `placeholder_prodotto_moretti_66`).
-- Imposta deps corretti per rispettare l'ordine logico:
-    • search_client → manage_cart  (solo se il cliente non è già noto)
-    • search_product → manage_cart  (solo se il prodotto non è già noto)
-    • search_client e search_product NON hanno mai dipendenze l'uno dall'altro: si eseguono sempre in parallelo.
-- Non creare task duplicati.
-- Non inventare dati: riportare solo ciò che è disponibile da osservazioni o ricerche.
+- Usa placeholder deterministici solo per dati non noti (es. `ph_cliente_gigio`, `ph_prodotto_ichnusa`).
+- Dipendenze: search_client → manage_cart (solo se client_id mancante); search_product → manage_cart (solo se sku mancante). search_client e search_product NON si dipendono mai.
+- Non creare search_client o search_product per dati già presenti nello stato.
 
 ----------------------------------------------------------------------
-
 📌 STATO ATTUALE
 ----------------------------------------------------------------------
 
-Lista clienti già risolti:
-{json.dumps(known_clients, indent=2)}
+Lista clienti già risolti (usa direttamente, SENZA search_client):
+{json.dumps(known_clients, indent=2, ensure_ascii=False)}
 
-Lista Prodotti già risolti:
-{json.dumps(known_products, indent=2)}
+Lista prodotti già risolti (usa direttamente, SENZA search_product):
+{json.dumps(known_products, indent=2, ensure_ascii=False)}
 
 ----------------------------------------------------------------------
-Genera ora il piano completo seguendo tutte le regole sopra.
-- Usa placeholders deterministici per dati mancanti.
-- Usa top_k adeguato per search_product.
-- Crea manage_cart solo se cliente e prodotto hanno ID o placeholder.
+Genera il piano rispettando la REGOLA PRIORITARIA: verifica sempre se
+client_id e sku sono già noti prima di pianificare ricerche.
 """
 
     try:
-        plan_raw = llm.invoke([
-        SystemMessage(content=system_prompt),
-        HumanMessage(content=getattr(state, "question", ""))
-    ])
+        # Passa gli ultimi 4 messaggi di chat (2 turni) per dare contesto al planner
+        messages = [SystemMessage(content=system_prompt)]
+        if state.chat_history:
+            messages.extend(state.chat_history[-4:])
+        messages.append(HumanMessage(content=state.question or ""))
+
+        plan_raw = llm.invoke(messages)
 
         #_rewrite_placeholders(plan_raw)
 
