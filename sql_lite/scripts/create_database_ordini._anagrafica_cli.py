@@ -1,3 +1,4 @@
+import csv
 import sqlite3
 import os
 
@@ -30,6 +31,8 @@ def setup_full_database():
     """)
 
     # 2. TABELLA ORDER (Testata)
+    # created_at è in formato ISO 8601: 'YYYY-MM-DD HH:MM:SS' (UTC)
+    # Usata per filtrare ordini per data/ora (es. "ordini di oggi", "ultimi 5 min")
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS [order] (
             order_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -40,6 +43,11 @@ def setup_full_database():
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             note TEXT
         )
+    """)
+    # Indice per query efficienti su data/ora
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_order_created_at
+        ON [order](created_at)
     """)
 
     # 3. TABELLA ORDER_ITEM (Righe)
@@ -71,15 +79,17 @@ def setup_full_database():
         )
     """)
 
-    # Inserimento dati dummy
-    clienti_dummy = [
-        ("C001", "Mario Rossi S.r.l.", "Bar Mario", "AG001", "Via Roma 10", "Milano"),
-        ("C002", "Pizzeria da Gigio di Luigi B.", "Gigio", "AG001", "Corso Italia 22", "Milano"),
-        ("C003", "Bevande e Bollicine S.p.A.", "B&B", "AG002", "Zona Industriale", "Paderno"),
-        ("C004", "Beck's Corner Pub", "Il Pubbe", "AG001", "Viale Abruzzi 101", "Milano"),
-        ("C005", "Ristorante Peroni & Figli", "Da Peroni", "AG001", "Piazza Duomo 1", "Milano")
-    ]
-    cursor.executemany("INSERT INTO clienti_fts VALUES (?, ?, ?, ?, ?, ?)", clienti_dummy)
+    # Inserimento clienti da CSV
+    csv_path = os.path.join(os.path.dirname(os.path.dirname(CURRENT_DIR)), "data", "clienti.csv")
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        clienti = [
+            (row["client_id"], row["ragione_sociale"], row["alias"],
+             row["agent_id"], row["indirizzo"], row["citta"])
+            for row in reader
+        ]
+    cursor.executemany("INSERT INTO clienti_fts VALUES (?, ?, ?, ?, ?, ?)", clienti)
+    print(f"   → {len(clienti)} clienti caricati da clienti.csv")
 
     conn.commit()
     conn.close()

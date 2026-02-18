@@ -21,9 +21,9 @@ langchain-google-genai>=1.0.0,<3.0.0
 openai>=1.60.0
 
 # --- LANGGRAPH ---
-langgraph>=0.2.0
-langgraph-checkpoint>=2.0.0
-langgraph-checkpoint-sqlite>=2.0.0
+langgraph>=1.0.0
+langgraph-checkpoint>=3.0.0
+langgraph-checkpoint-sqlite>=3.0.0
 aiosqlite==0.22.1
 
 # --- UTILS ---

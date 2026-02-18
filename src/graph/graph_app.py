@@ -2,6 +2,9 @@ import os
 import json
 import logging
 import sqlite3
+import smtplib
+from datetime import datetime
+from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional, Literal, Union, TypedDict
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
@@ -84,10 +87,17 @@ class CartArgs(BaseModel):
     description: Optional[str] = None        # brand + formato, popolato dall'executor
 
 class SearchProductArgs(BaseModel):
-    placeholder: str   
+    placeholder: str
     query: str
     filters_json: str = ""
     top_k: int = 10
+
+class OrderArgs(BaseModel):
+    action: Literal["insert_order", "list_orders"]
+    client_id: Optional[str] = None      # obbligatorio per insert_order
+    date_from: Optional[str] = None      # ISO datetime: "YYYY-MM-DD HH:MM:SS"
+    date_to: Optional[str] = None        # ISO datetime: "YYYY-MM-DD HH:MM:SS"
+    status_filter: Optional[str] = None  # es. "RECEIVED"
 
 # =============================================================================
 # TASK E PIANO
@@ -95,11 +105,12 @@ class SearchProductArgs(BaseModel):
 class Task(BaseModel):
     id: str
     tool: Literal[
-        "search_client", 
-        "search_product", 
+        "search_client",
+        "search_product",
         "manage_cart",
+        "manage_orders",
     ]
-    args: Union[SearchClientArgs, CartArgs, SearchProductArgs]
+    args: Union[SearchClientArgs, CartArgs, SearchProductArgs, OrderArgs]
     deps: List[str] = Field(default_factory=list)  # ID task da completare prima
     status: Literal["pending", "success", "failed"] = "pending"
 
@@ -130,6 +141,7 @@ class AgentState(BaseModel):
     observations: Dict[str, Any] = {}
     iteration: int = 0
     final_answer: Optional[Any] = None
+    current_datetime: Optional[str] = None  # popolato dall'endpoint ad ogni messaggio
 
 class ExecutionContext(BaseModel):
     """
@@ -160,6 +172,66 @@ class ExecutionContext(BaseModel):
         # Evita serializzazione nei checkpoint
         underscore_attrs_are_private = True
         arbitrary_types_allowed = True
+
+# =============================================================================
+# EMAIL CONFERMA ORDINE
+# =============================================================================
+def send_order_email(order_result: dict, known_clients: dict) -> bool:
+    """
+    Invia una email di conferma ordine via Gmail SMTP (App Password).
+    Legge GMAIL_FROM e GMAIL_APP_PASSWORD dal .env.
+    L'email viene inviata all'agente stesso come ricevuta/conferma.
+    """
+    gmail_from = os.getenv("GMAIL_FROM", "")
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "")
+
+    if not gmail_from or not gmail_password:
+        print("⚠️ GMAIL_FROM o GMAIL_APP_PASSWORD non configurati — email non inviata")
+        return False
+
+    order_id = order_result.get("order_id")
+    client_id = order_result.get("client_id", "")
+    total = order_result.get("total", 0.0)
+    items = order_result.get("items", [])
+
+    client_info = known_clients.get(client_id, {})
+    client_name = client_info.get("ragione_sociale") or client_info.get("alias") or client_id
+
+    items_lines = "\n".join(
+        "  • {desc} x{qty} — €{tot:.2f}".format(
+            desc=r.get("description") or r.get("sku", ""),
+            qty=r.get("quantity", ""),
+            tot=(r.get("price") or 0.0) * (r.get("quantity") or 0),
+        )
+        for r in items
+    )
+
+    body = (
+        f"Nuovo ordine confermato dal sistema Sales Bot.\n\n"
+        f"Ordine: #{order_id}\n"
+        f"Cliente: {client_name} ({client_id})\n"
+        f"Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"Stato: RECEIVED\n\n"
+        f"Prodotti:\n{items_lines if items_lines else '  (nessun dettaglio)'}\n\n"
+        f"Totale: €{total:.2f}\n"
+        f"---\nSales Automation Bot\n"
+    )
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = f"Ordine #{order_id} confermato — {client_name}"
+    msg["From"] = gmail_from
+    msg["To"] = gmail_from  # self-confirmation all'agente
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
+            smtp.login(gmail_from, gmail_password)
+            smtp.sendmail(gmail_from, [gmail_from], msg.as_string())
+        print(f"✅ Email ordine #{order_id} inviata a {gmail_from}")
+        return True
+    except Exception as e:
+        print(f"❌ Errore invio email: {e}")
+        return False
+
 
 # =============================================================================
 # GESTIONE CARRELLO
@@ -230,6 +302,146 @@ def sql_manage_cart(agent_code: str, args: CartArgs):
     finally:
         conn.close()
 
+
+def _get_db_path():
+    current_file_path = os.path.abspath(__file__)
+    project_root = os.path.dirname(os.path.dirname(os.path.dirname(current_file_path)))
+    return os.path.join(project_root, "sql_lite", "db", "database_ordini.db")
+
+
+def sql_insert_order(agent_code: str, args: "OrderArgs"):
+    """
+    Converte il carrello (cart_item) di un cliente in un ordine confermato.
+    Inserisce la testata in [order] e le righe in order_item, poi svuota cart_item.
+    Restituisce un dict con order_id e riepilogo.
+    """
+    db_path = _get_db_path()
+    if not os.path.exists(db_path):
+        return {"error": f"Database non trovato in {db_path}"}
+
+    client_id = args.client_id
+    if not client_id:
+        return {"error": "client_id obbligatorio per insert_order"}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("PRAGMA foreign_keys = ON;")
+
+        # Leggi il carrello
+        cursor.execute("""
+            SELECT sku, description, quantity, price
+            FROM cart_item
+            WHERE agent_id = ? AND client_id = ?
+        """, (agent_code, client_id))
+        items = cursor.fetchall()
+
+        if not items:
+            return {"error": "Carrello vuoto — nessun ordine creato"}
+
+        items = [dict(r) for r in items]
+        total = sum(
+            (r["quantity"] or 0) * (r["price"] or 0.0)
+            for r in items
+        )
+
+        # Inserisci testata ordine
+        cursor.execute("""
+            INSERT INTO [order] (client_id, agent_id, status, total_amount)
+            VALUES (?, ?, 'RECEIVED', ?)
+        """, (client_id, agent_code, round(total, 2)))
+        order_id = cursor.lastrowid
+
+        # Inserisci righe ordine
+        for r in items:
+            cursor.execute("""
+                INSERT INTO order_item (order_id, sku, description, quantity, price_at_order)
+                VALUES (?, ?, ?, ?, ?)
+            """, (order_id, r["sku"], r["description"], r["quantity"], r["price"]))
+
+        # Svuota carrello
+        cursor.execute(
+            "DELETE FROM cart_item WHERE agent_id = ? AND client_id = ?",
+            (agent_code, client_id)
+        )
+
+        conn.commit()
+        print(f"✅ Ordine #{order_id} creato per cliente {client_id} | Totale €{total:.2f}")
+        return {
+            "order_id": order_id,
+            "client_id": client_id,
+            "total": round(total, 2),
+            "items_count": len(items),
+            "items": items,
+            "status": "RECEIVED",
+        }
+
+    except Exception as e:
+        conn.rollback()
+        print(f"💥 [SQL ERROR insert_order]: {e}")
+        return {"error": str(e)}
+    finally:
+        conn.close()
+
+
+def sql_list_orders(agent_code: str, args: "OrderArgs"):
+    """
+    Restituisce gli ordini dell'agente con filtri opzionali su cliente,
+    stato e intervallo di date.
+    """
+    db_path = _get_db_path()
+    if not os.path.exists(db_path):
+        return {"error": f"Database non trovato in {db_path}"}
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+
+    try:
+        query = """
+            SELECT o.order_id, o.client_id, o.status, o.total_amount, o.created_at
+            FROM [order] o
+            WHERE o.agent_id = ?
+        """
+        params = [agent_code]
+
+        if args.client_id:
+            query += " AND o.client_id = ?"
+            params.append(args.client_id)
+        if args.status_filter:
+            query += " AND o.status = ?"
+            params.append(args.status_filter)
+        if args.date_from:
+            query += " AND o.created_at >= ?"
+            params.append(args.date_from)
+        if args.date_to:
+            query += " AND o.created_at <= ?"
+            params.append(args.date_to)
+
+        query += " ORDER BY o.created_at DESC LIMIT 20"
+
+        cursor.execute(query, params)
+        orders = [dict(r) for r in cursor.fetchall()]
+
+        # Per ogni ordine carica le righe
+        for order in orders:
+            cursor.execute("""
+                SELECT sku, description, quantity, price_at_order
+                FROM order_item WHERE order_id = ?
+            """, (order["order_id"],))
+            order["items"] = [dict(r) for r in cursor.fetchall()]
+
+        return orders if orders else []
+
+    except Exception as e:
+        print(f"💥 [SQL ERROR list_orders]: {e}")
+        return {"error": str(e)}
+    finally:
+        conn.close()
+
+
 # =============================================================================
 # PLANNER NODE
 # =============================================================================
@@ -240,7 +452,8 @@ def planner_node(state: AgentState):
     agent_code = getattr(state, "agent_code", "AG001")
     known_clients = getattr(state, "known_clients", {})
     known_products = getattr(state, "known_products", {})
-    
+    current_datetime = getattr(state, "current_datetime", "N/D")
+
     system_prompt = f"""
 Sei un assistente virtuale per agenti commerciali che servono e riforniscono clienti per il settore Horeca.
 Il tuo compito è generare UN PIANO COMPLETO E DEFINITIVO per soddisfare la richiesta dell'agente umano {agent_code}.
@@ -287,7 +500,7 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 
 3️⃣ **manage_cart** — args: CartArgs(action, client_id, sku, quantity)
 - action: "add" | "remove" | "view" | "clear"
-- Pianifica quando l'utente vuole ordinare, rimuovere, visualizzare o svuotare il carrello.
+- Pianifica quando l'utente vuole aggiungere, rimuovere, visualizzare o svuotare il carrello.
   L'utente non usa necessariamente il termine "carrello" — interpreta l'intento.
 - client_id: usa ID reale da "Lista clienti già risolti" o placeholder di search_client.
 - sku: usa SKU reale da "Lista prodotti già risolti" o placeholder di search_product.
@@ -301,18 +514,39 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 - deps: includi search_client se client_id mancante; includi search_product se sku mancante.
   Se entrambi già noti → deps vuoti.
 
+4️⃣ **manage_orders** — args: OrderArgs(action, client_id, date_from, date_to, status_filter)
+- action: "insert_order" | "list_orders"
+- **insert_order**: conferma e invia l'ordine. Legge il carrello del cliente, crea l'ordine nel
+  DB con un ID progressivo automatico (order_id), svuota il carrello.
+  ⚠️ PIANIFICA insert_order SOLO se il messaggio dell'utente è una conferma esplicita dell'ordine:
+  parole come "sì", "confermo", "invia", "procedi", "ok manda", "vai". NON pianificare
+  insert_order quando l'utente sta fornendo una quantità, un nome di prodotto o un nome di
+  cliente — in quei casi l'utente sta completando l'ordine, non confermandolo.
+  NON combinare mai add (manage_cart) e insert_order nello stesso piano.
+  Richiede client_id reale. Se non determinabile, crea search_client con deps.
+- **list_orders**: elenca gli ordini dell'agente. Filtri opzionali:
+  - client_id: per vedere ordini di un cliente specifico
+  - date_from / date_to: intervallo ISO datetime "YYYY-MM-DD HH:MM:SS"
+    Per "ordini di oggi": date_from = "{current_datetime[:10]} 00:00:00"
+    Per "ultimi N minuti": calcola sottraendo N minuti da current_datetime
+  - status_filter: "RECEIVED" (default), "SHIPPED", etc.
+- Non dipende da manage_cart.
+
 ----------------------------------------------------------------------
 📌 REGOLE DI PIANIFICAZIONE
 ----------------------------------------------------------------------
 
 - Crea task separati per ogni cliente o prodotto citato.
 - Usa placeholder deterministici solo per dati non noti (es. `ph_cliente_gigio`, `ph_prodotto_ichnusa`).
-- Dipendenze: search_client → manage_cart (solo se client_id mancante); search_product → manage_cart (solo se sku mancante). search_client e search_product NON si dipendono mai.
+- Dipendenze: search_client → manage_cart/manage_orders (solo se client_id mancante);
+  search_product → manage_cart (solo se sku mancante). search_client e search_product NON si dipendono mai.
 - Non creare search_client o search_product per dati già presenti nello stato.
 
 ----------------------------------------------------------------------
 📌 STATO ATTUALE
 ----------------------------------------------------------------------
+
+Data e ora corrente (usala per calcolare filtri temporali): {current_datetime}
 
 Lista clienti già risolti (usa direttamente, SENZA search_client):
 {json.dumps(known_clients, indent=2, ensure_ascii=False)}
@@ -506,10 +740,35 @@ def executor_node(state: AgentState):
                 # -----------------------------------------------------------------
                 # MANAGE CART
                 # -----------------------------------------------------------------
-                elif task.tool == "manage_cart":
+                elif task.tool in ("manage_cart", "manage_orders"):
+                    # Il planner a volte usa manage_cart anche per azioni ordine:
+                    # se l'azione è insert_order o list_orders, ridirigiamo al gestore ordini.
+                    if task.args.action in ("insert_order", "list_orders"):
+                        task.tool = "manage_orders"  # normalizza il tool name
+                        print(f" 📦 Azione ordine (redirect): {task.args.action} | client_id={task.args.client_id}")
+
+                        if task.args.action == "insert_order":
+                            if not task.args.client_id or str(task.args.client_id).startswith("ph_"):
+                                obs[task.id] = {"error": "client_required", "action": "insert_order"}
+                                task.status = "failed"
+                            else:
+                                res = sql_insert_order(agent_code=agent_code, args=task.args)
+                                obs[task.id] = res
+                                task.status = "success" if "order_id" in res else "failed"
+                                if task.status == "success":
+                                    send_order_email(res, updated_known_clients)
+
+                        elif task.args.action == "list_orders":
+                            res = sql_list_orders(agent_code=agent_code, args=task.args)
+                            obs[task.id] = res
+                            task.status = "success" if not isinstance(res, dict) or "error" not in res else "failed"
+
+                        # Salta il resto del blocco manage_cart
+                        continue  # noqa
+
                     print(
                         f" 🛒 Azione: {task.args.action} | "
-                        f"client_id={task.args.client_id} | sku={task.args.sku} | qty={task.args.quantity}"
+                        f"client_id={task.args.client_id} | sku={getattr(task.args, 'sku', None)} | qty={getattr(task.args, 'quantity', None)}"
                     )
 
                     # Verifica che client_id sia stato risolto (non più un placeholder)
@@ -617,6 +876,12 @@ def responder_node(state: AgentState):
     # Tipo di operazione carrello
     is_cart_view = any(getattr(t.args, "action", None) == "view" for t in cart_tasks)
     is_cart_mutated = was_added or was_removed
+
+    # Rilevamento ordine confermato (insert_order riuscito)
+    confirmed_order = next(
+        (v for v in obs.values() if isinstance(v, dict) and "order_id" in v),
+        None
+    )
 
     # Risolvi nome cliente dal primo task manage_cart (usa sempre ragione_sociale)
     cart_client_name = None
@@ -762,7 +1027,10 @@ REGOLE MANDATORIE:
 12. Se nelle osservazioni trovi {{"error": "quantity_required"}}, NON aggiungere nulla al carrello.
     Chiedi esplicitamente quante unità vuole aggiungere, usando il nome del prodotto (non lo SKU).
 13. Se nelle osservazioni trovi {{"error": "client_required"}}, il cliente non era specificato.
-    Chiedi esplicitamente: "Per quale cliente vuoi [action] il carrello?"{cart_rules}
+    Chiedi esplicitamente: "Per quale cliente vuoi [action] il carrello?"
+14. {"ORDINE CONFERMATO — usa solo queste informazioni per rispondere:" if confirmed_order else ""}
+    {f"Ordine #{confirmed_order['order_id']} confermato per {confirmed_order.get('client_id', '')}. Totale: €{confirmed_order.get('total', 0):.2f} ({confirmed_order.get('items_count', 0)} prodotti). Rispondi con un messaggio di conferma chiaro, includi il numero ordine." if confirmed_order else ""}
+    {"NON chiedere di nuovo se vuole confermare — l'ordine è già stato creato." if confirmed_order else ""}{cart_rules if not confirmed_order else ""}
 """
 
     # 5️⃣ Invocazione modello
