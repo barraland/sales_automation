@@ -79,7 +79,9 @@ class CartArgs(BaseModel):
     action: Literal["add", "remove", "view", "clear"]
     client_id: str                            # può essere un ID reale o un placeholder
     sku: Optional[str] = None                # può essere SKU reale o placeholder
-    quantity: Optional[int] = 1
+    quantity: Optional[int] = None           # DEVE essere esplicitata dall'utente per "add"
+    price: Optional[float] = None            # prezzo unitario, popolato dall'executor
+    description: Optional[str] = None        # brand + formato, popolato dall'executor
 
 class SearchProductArgs(BaseModel):
     placeholder: str   
@@ -181,11 +183,14 @@ def sql_manage_cart(agent_code: str, args: CartArgs):
         if args.action == "add":
             print(f"📝 [DB ACCESS] Agent {agent_code} is INSERTING for Client {args.client_id}")
             cursor.execute("""
-                INSERT INTO cart_item (agent_id, client_id, sku, quantity)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO cart_item (agent_id, client_id, sku, description, quantity, price)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(agent_id, client_id, sku)
-                DO UPDATE SET quantity = quantity + excluded.quantity
-            """, (agent_code, args.client_id, args.sku, args.quantity or 1))
+                DO UPDATE SET
+                    quantity = quantity + excluded.quantity,
+                    description = COALESCE(excluded.description, cart_item.description),
+                    price = COALESCE(excluded.price, cart_item.price)
+            """, (agent_code, args.client_id, args.sku, args.description, args.quantity or 1, args.price))
 
             res = f"Aggiunto {args.quantity or 1}x SKU {args.sku} al carrello per cliente {args.client_id}."
 
@@ -256,6 +261,13 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 
 4. **Operazione incompleta**: Se dalla chat history risulta un'operazione in corso rimasta in attesa (cliente o prodotto mancante), e il messaggio attuale fornisce l'informazione mancante, ricostruisci l'operazione completa con manage_cart usando i dati ora disponibili.
 
+5. **Cliente implicito dalla conversazione**: Se il messaggio attuale NON menziona un cliente
+   ma dalla chat history recente è chiaro su quale cliente si stava lavorando (es. si stava
+   visualizzando il carrello, aggiungendo prodotti, o discutendo di un cliente specifico),
+   usa quel client_id direttamente. NON pianificare search_client e NON chiedere il cliente
+   all'utente. L'agente può lavorare su più clienti, ma se il contesto recente punta a uno
+   specifico, quello è il cliente corretto.
+
 ----------------------------------------------------------------------
 📌 STRUTTURA DEI TASK E TOOLS
 ----------------------------------------------------------------------
@@ -279,8 +291,13 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
   L'utente non usa necessariamente il termine "carrello" — interpreta l'intento.
 - client_id: usa ID reale da "Lista clienti già risolti" o placeholder di search_client.
 - sku: usa SKU reale da "Lista prodotti già risolti" o placeholder di search_product.
-- Per "view" / "clear": usa il client_id del cliente menzionato più di recente in conversazione.
-  Solo se non determinabile, crea search_client per chiederlo.
+- quantity: per action "add", imposta il numero indicato dall'utente. Se l'utente NON ha
+  specificato una quantità numerica esplicita, lascia quantity=null. Il sistema chiederà
+  automaticamente. NON inventare quantità di default.
+- Per "view" / "clear": usa il client_id del cliente menzionato più di recente in conversazione
+  o in "Lista clienti già risolti". Se NON è determinabile, DEVI creare un task search_client
+  con query_text vuoto (elenca tutti i clienti dell'agente) e fare in modo che manage_cart
+  dipenda da esso. NON usare placeholder inventati senza un search_client corrispondente.
 - deps: includi search_client se client_id mancante; includi search_product se sku mancante.
   Se entrambi già noti → deps vuoti.
 
@@ -468,6 +485,8 @@ def executor_node(state: AgentState):
                                     "descrizione": r.get("descrizione"),
                                     "brand": r.get("brand"),
                                     "formato": r.get("formato"),
+                                    "prezzo": r.get("prezzo"),
+                                    "stock": r.get("stock"),
                                 }
 
                         if len(results) == 1 and getattr(task.args, "placeholder", None):
@@ -490,16 +509,50 @@ def executor_node(state: AgentState):
                 elif task.tool == "manage_cart":
                     print(
                         f" 🛒 Azione: {task.args.action} | "
-                        f"client_id={task.args.client_id} | sku={task.args.sku}"
+                        f"client_id={task.args.client_id} | sku={task.args.sku} | qty={task.args.quantity}"
                     )
-                    res = sql_manage_cart(agent_code=agent_code, args=task.args)
-                    obs[task.id] = res
-                    if res and "Errore" not in str(res):
-                        print(" ✅ Operazione carrello completata")
-                        task.status = "success"
-                    else:
-                        print(" ❌ Errore operazione carrello")
+
+                    # Verifica che client_id sia stato risolto (non più un placeholder)
+                    if str(task.args.client_id).startswith("ph_"):
+                        obs[task.id] = {
+                            "error": "client_required",
+                            "action": task.args.action,
+                        }
                         task.status = "failed"
+                        print(" ⚠️ client_id non risolto — il responder chiederà il cliente")
+
+                    # Verifica quantità obbligatoria per add
+                    elif task.args.action == "add" and not task.args.quantity:
+                        obs[task.id] = {
+                            "error": "quantity_required",
+                            "sku": task.args.sku,
+                            "client_id": task.args.client_id,
+                        }
+                        task.status = "failed"
+                        print(" ⚠️ Quantità mancante — il responder chiederà all'utente")
+                    else:
+                        # Arricchisci price e description da known_products (se add)
+                        if task.args.action == "add" and task.args.sku:
+                            product_info = updated_known_products.get(task.args.sku, {})
+                            if product_info:
+                                if task.args.price is None:
+                                    task.args.price = product_info.get("prezzo")
+                                if task.args.description is None:
+                                    brand = product_info.get("brand") or ""
+                                    formato = product_info.get("formato") or ""
+                                    task.args.description = (
+                                        f"{brand} {formato}".strip()
+                                        or product_info.get("descrizione")
+                                    )
+
+                        res = sql_manage_cart(agent_code=agent_code, args=task.args)
+                        obs[task.id] = res
+                        if res and "Errore" not in str(res):
+                            print(" ✅ Operazione carrello completata")
+                            task.status = "success"
+                        else:
+                            print(" ❌ Errore operazione carrello")
+                            task.status = "failed"
 
                 else:
                     print(f" ⚠️ TOOL NON RICONOSCIUTO: {task.tool}")
@@ -553,16 +606,121 @@ def responder_node(state: AgentState):
 
     # 3️⃣ Analisi osservazioni reali
     obs = state.observations
+    known_clients = getattr(state, "known_clients", {})
+    known_products = getattr(state, "known_products", {})
+    cart_tasks = [t for t in getattr(state, "next_tasks", []) if t.tool == "manage_cart"]
 
-    # Verifica INSERT riuscita
-    cart_actions = [v for v in obs.values() if "Aggiunto" in str(v)]
-    was_added = len(cart_actions) > 0
+    # Verifica INSERT riuscita / rimozione
+    was_added = any("Aggiunto" in str(v) for v in obs.values())
+    was_removed = any("Rimosso" in str(v) for v in obs.values())
+
+    # Tipo di operazione carrello
+    is_cart_view = any(getattr(t.args, "action", None) == "view" for t in cart_tasks)
+    is_cart_mutated = was_added or was_removed
+
+    # Risolvi nome cliente dal primo task manage_cart (usa sempre ragione_sociale)
+    cart_client_name = None
+    for t in cart_tasks:
+        cid = getattr(t.args, "client_id", None)
+        if cid and cid in known_clients:
+            info = known_clients[cid]
+            cart_client_name = info.get("ragione_sociale") or info.get("alias") or cid
+            break
+        elif cid:
+            cart_client_name = cid
+            break
 
     # Verifica presenza liste (clienti/prodotti multipli da disambiguare)
     found_lists = [
         v for v in obs.values()
         if isinstance(v, dict) and v.get("pending_selection")
     ]
+    n_pending = len(found_lists)
+
+    # Pre-formatta il blocco testo per disambiguazione multipla (Opzione B)
+    multi_disambiguation_text = ""
+    if n_pending >= 2:
+        blocks = []
+        for task_id, v in obs.items():
+            if not (isinstance(v, dict) and v.get("pending_selection")):
+                continue
+            results = v.get("results", [])[:5]  # max 5 opzioni per prodotto
+            # Capisce se è ricerca clienti o prodotti dal contenuto
+            if results and "ragione_sociale" in results[0]:
+                label = results[0].get("ragione_sociale", task_id)
+                lines = [f"*Clienti trovati*:"]
+                for i, r in enumerate(results, 1):
+                    lines.append(f"{i}. {r.get('ragione_sociale')} ({r.get('alias', '')}) — {r.get('citta', '')}")
+            else:
+                query_label = task_id
+                lines = [f"*{results[0].get('brand', task_id) if results else task_id}* ({len(v.get('results', []))} risultati):"]
+                for i, r in enumerate(results, 1):
+                    prezzo = f"€{r['prezzo']:.2f}" if r.get("prezzo") else ""
+                    stock = f"Disp: {r['stock']}" if r.get("stock") is not None else ""
+                    desc = f"{r.get('brand', '')} {r.get('formato', '')}".strip() or r.get("descrizione", "")
+                    extra = " | ".join(filter(None, [prezzo, stock]))
+                    lines.append(f"{i}. {desc}" + (f" — {extra}" if extra else ""))
+            blocks.append("\n".join(lines))
+        multi_disambiguation_text = "\n\n".join(blocks)
+
+    # Se operazione riuscita, recupera carrello aggiornato per mostrarlo
+    cart_after_mutation = None
+    if is_cart_mutated and cart_tasks:
+        try:
+            cid = getattr(cart_tasks[0].args, "client_id", None)
+            agent_code_val = getattr(state, "agent_code", "AG001")
+            if cid:
+                view_args = CartArgs(action="view", client_id=cid)
+                raw_view = sql_manage_cart(agent_code_val, view_args)
+                if isinstance(raw_view, list):
+                    def _resolve_desc(sku, db_desc):
+                        if db_desc:
+                            return db_desc
+                        info = known_products.get(sku, {})
+                        brand = info.get("brand") or ""
+                        formato = info.get("formato") or ""
+                        return (f"{brand} {formato}".strip()
+                                or info.get("descrizione")
+                                or sku)
+                    cart_after_mutation = [
+                        {
+                            "sku": r.get("sku"),
+                            "descrizione": _resolve_desc(r.get("sku"), r.get("description")),
+                            "quantità": r.get("quantity"),
+                            "prezzo_unitario": r.get("price"),
+                        }
+                        for r in raw_view
+                    ]
+        except Exception:
+            pass
+
+    # Regole dinamiche carrello
+    cart_rules = ""
+    if is_cart_view and cart_client_name:
+        cart_rules += f"\n13. Inizia la risposta sul carrello con 'Carrello di {cart_client_name}:' prima di elencare i prodotti."
+    if is_cart_mutated:
+        nome = f"di {cart_client_name}" if cart_client_name else ""
+        if cart_after_mutation:
+            cart_summary = "\n".join(
+                "• {desc} x{qty}{total}".format(
+                    desc=r["descrizione"],
+                    qty=r["quantità"],
+                    total=(
+                        f" — €{r['prezzo_unitario'] * r['quantità']:.2f}"
+                        if r.get("prezzo_unitario") and r.get("quantità")
+                        else ""
+                    ),
+                )
+                for r in cart_after_mutation
+            )
+            cart_rules += (
+                f"\n14. Dopo aver confermato l'operazione, riporta il seguente riepilogo carrello {nome} "
+                f"(già formattato, copialo senza modifiche):\n"
+                f"{cart_summary}\n"
+                f"Poi chiedi: 'Vuoi confermare e inviare l'ordine?'"
+            )
+        else:
+            cart_rules += f"\n14. Dopo aver confermato l'operazione, chiedi: 'Vuoi confermare e inviare l'ordine?'"
 
     # 4️⃣ System grounding (vincola il modello ai fatti reali)
     system_msg = f"""
@@ -574,20 +732,37 @@ STATO REALE (Fonte di Verità):
 - Risultati Tool (Observations):
 {json.dumps(obs, indent=2, default=str)}
 
+Mappa clienti (usa ragione_sociale per riferirsi ai clienti):
+{json.dumps({cid: info.get("ragione_sociale", cid) for cid, info in known_clients.items()}, indent=2, ensure_ascii=False)}
+
 REGOLE MANDATORIE:
 
 1. NON DIRE MAI "Ho aggiunto al carrello" se 'Prodotti aggiunti al DB' è NO.
 2. Se l'operazione è fallita perché manca il cliente,
    chiedi: "Per quale cliente vuoi ordinare?"
-3. Se ci sono risultati con 'pending_selection: true' per clienti,
-   usa use_interactive_list=True per elencarli.
-4. Se ci sono risultati con 'pending_selection: true' per prodotti,
-   usa use_interactive_list=True per elencarli.
+3. Se c'è ESATTAMENTE UN risultato con 'pending_selection: true' (clienti o prodotti),
+   usa use_interactive_list=True per elencare le opzioni.
+4. Se ci sono DUE O PIÙ risultati con 'pending_selection: true', NON usare la lista
+   interattiva. Manda invece un messaggio di testo con tutte le opzioni già formattate:
+---
+{multi_disambiguation_text if multi_disambiguation_text else "(nessuna disambiguazione multipla)"}
+---
+   Concludi con: "Rispondimi specificando il prodotto/formato scelto per ciascuno."
 5. Sii sintetico e professionale.
-6. Usa il grassetto per i prodotti.
+6. Usa il grassetto per i nomi dei prodotti (descrizione, non il codice SKU).
 7. Se vedi un errore SQLite nelle osservazioni,
    riferisci che c'è stato un problema tecnico.
 8. Non inventare mai dati non presenti nelle Observations.
+9. Quando mostri prodotti in lista di selezione (pending_selection=true per prodotti),
+   per ogni voce mostra: nome/brand, formato, prezzo unitario e disponibilità (stock).
+10. Non mostrare mai codici SKU o codici prodotto all'utente, a meno che non lo chieda
+    esplicitamente. Usa sempre la descrizione/nome del prodotto.
+11. Quando menzioni un cliente, usa SEMPRE la ragione sociale completa dalla mappa clienti
+    qui sopra. Non usare alias, soprannomi o nomi parziali.
+12. Se nelle osservazioni trovi {{"error": "quantity_required"}}, NON aggiungere nulla al carrello.
+    Chiedi esplicitamente quante unità vuole aggiungere, usando il nome del prodotto (non lo SKU).
+13. Se nelle osservazioni trovi {{"error": "client_required"}}, il cliente non era specificato.
+    Chiedi esplicitamente: "Per quale cliente vuoi [action] il carrello?"{cart_rules}
 """
 
     # 5️⃣ Invocazione modello
