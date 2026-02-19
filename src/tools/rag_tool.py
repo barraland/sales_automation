@@ -183,7 +183,8 @@ def search_product_smart(
 
 def get_catalog_facets(
     facet_fields: Optional[List[str]] = None,
-    max_values_per_facet: int = 100
+    max_values_per_facet: int = 100,
+    odata_filter: Optional[str] = None
 ) -> Dict[str, List[str]]:
     """
     Recupera valori distinti di brand, categoria, ecc. direttamente dalle FACETS
@@ -193,6 +194,8 @@ def get_catalog_facets(
         facet_fields: lista campi su cui calcolare le facets.
                       Default: ["brand", "categoria"]
         max_values_per_facet: numero massimo valori per facet
+        odata_filter: filtro OData opzionale (es. "categoria eq 'Birra'" per
+                      recuperare solo i brand di una certa categoria)
 
     Returns:
         {
@@ -216,7 +219,8 @@ def get_catalog_facets(
         results = search_client.search(
             search_text="*",        # nessun filtro semantico
             top=0,                  # non vogliamo documenti
-            facets=facets_query
+            facets=facets_query,
+            filter=odata_filter
         )
 
         facet_data = results.get_facets()

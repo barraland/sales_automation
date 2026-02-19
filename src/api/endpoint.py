@@ -1,6 +1,7 @@
 ### src.api.endpoint.py
 import uvicorn
 import requests
+import csv
 import json
 import os
 import tempfile
@@ -20,12 +21,16 @@ PHONE_NUMBER_ID = "1043497188838302"
 VERIFY_TOKEN = "my_verify_token_123"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 
-# --- MAPPING AGENTI (Il cuore della soluzione) ---
-# In produzione qui potresti interrogare una tabella SQL Agenti
-AGENT_MAPPING = {
-    "393755116724": "AG001",
-    "393441234567": "AG002"
-}
+# --- MAPPING AGENTI caricato da data/agenti.csv (telefono → codice) ---
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_agenti_csv = os.path.join(_project_root, "data", "agenti.csv")
+AGENT_MAPPING: dict = {}
+if os.path.exists(_agenti_csv):
+    with open(_agenti_csv, newline="", encoding="utf-8") as _f:
+        for _row in csv.DictReader(_f):
+            AGENT_MAPPING[_row["telefono"]] = _row["codice"]
+else:
+    print(f"⚠️ File agenti non trovato: {_agenti_csv} — nessun agente mappato")
 
 def transcribe_audio(media_id: str) -> str | None:
     """
@@ -97,46 +102,50 @@ def transcribe_and_process(sender_id: str, media_id: str):
         send_whatsapp_message(sender_id, _Msg())
 
 
+def run_graph(sender_id: str, user_text: str):
+    """
+    Cuore della pipeline: esegue il grafo e restituisce l'oggetto FinalAnswer.
+    Usato sia da process_and_respond (WhatsApp) sia da /test/chat (test locale).
+    """
+    agent_code = AGENT_MAPPING.get(sender_id, "AG001")
+    config = {"configurable": {"thread_id": sender_id}}
+
+    current_state = beverage_agent.get_state(config)
+    state_values = current_state.values if current_state.values else {}
+    history = (
+        state_values.get("chat_history", [])
+        if isinstance(state_values, dict)
+        else getattr(state_values, "chat_history", [])
+    )
+
+    inputs = {
+        "question": user_text,
+        "chat_history": history,
+        "observations": {},
+        "agent_code": agent_code,
+        "is_finished": False,
+        "next_tasks": [],
+        "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+    result = beverage_agent.invoke(inputs, config=config)
+
+    answer = result.get("final_answer", "Non ho trovato informazioni specifiche.")
+    history_text = answer.text if hasattr(answer, "text") else str(answer)
+    new_history = history + [HumanMessage(content=user_text), AIMessage(content=history_text)]
+
+    beverage_agent.update_state(config, {"chat_history": new_history})
+
+    return answer
+
+
 def process_and_respond(sender_id: str, user_text: str):
     print("\n" + "="*40)
     print(f"📩 NUOVO MESSAGGIO DA: {sender_id}")
     print(f"💬 TESTO: {user_text}")
     print("="*40)
 
-
-    agent_code = AGENT_MAPPING.get(sender_id, "AG001")
-    config = {"configurable": {"thread_id": sender_id}}
-
-    # ✅ Recupera stato corrente (snapshot)
-    current_state = beverage_agent.get_state(config)
-    state_values = current_state.values if current_state.values else {}
-
-    # ✅ Leggi campi già presenti nello snapshot
-    history = state_values.get("chat_history", []) if isinstance(state_values, dict) else getattr(state_values, "chat_history", [])
-
-    # ✅ Prepara input completo per invoke — include reset is_finished e question
-    inputs = {
-        "question": user_text,
-        "chat_history": history,
-        "observations": {},        # reset observations a ogni nuova richiesta
-        "agent_code": agent_code,
-        "is_finished": False,
-        "next_tasks": [],          # reset task del turno precedente
-        "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-    }
-
-    # ✅ Invoca il grafo
-    result = beverage_agent.invoke(inputs, config=config)
-
-    answer = result.get("final_answer", "Non ho trovato informazioni specifiche.")
-    history_text = answer.text if hasattr(answer, 'text') else str(answer)
-    new_history = history + [HumanMessage(content=user_text), AIMessage(content=history_text)]
-
-    # ✅ Aggiorna lo stato con la chat aggiornata (campi dichiarati in AgentState)
-    beverage_agent.update_state(config, {
-        "chat_history": new_history,
-    })
-
+    answer = run_graph(sender_id, user_text)
     send_whatsapp_message(sender_id, answer)
 
 def send_whatsapp_message(to: str, content):
@@ -235,6 +244,48 @@ async def verify(request: Request):
     if p.get("hub.verify_token") == VERIFY_TOKEN:
         return PlainTextResponse(content=p.get("hub.challenge"))
     return Response(content="Forbidden", status_code=403)
+
+@app.post("/test/chat")
+async def test_chat(request: Request):
+    """
+    Endpoint per test locale. Chiama run_graph() sincronamente e ritorna
+    la risposta come JSON — niente chiamate WhatsApp/Meta.
+
+    Body: {"sender_id": "393755116724", "text": "..."}
+    sender_id opzionale: default al primo agente mappato (AG001).
+    """
+    body = await request.json()
+    text = body.get("text", "").strip()
+    if not text:
+        return {"error": "Campo 'text' obbligatorio"}
+
+    default_sender = next(iter(AGENT_MAPPING))  # primo sender → AG001
+    sender_id = body.get("sender_id", default_sender)
+
+    answer = run_graph(sender_id, text)
+
+    response = {"text": answer.text if hasattr(answer, "text") else str(answer)}
+    if getattr(answer, "use_interactive_list", False):
+        response["list"] = [
+            {"id": item.id, "title": item.title, "description": getattr(item, "description", "")}
+            for item in answer.items
+        ]
+    return response
+
+
+@app.delete("/test/chat")
+async def test_reset(request: Request):
+    """
+    Resetta la chat history di un sender (pulisce il checkpoint SQLite).
+    Body: {"sender_id": "393755116724"}  — opzionale, default AG001.
+    """
+    body = await request.json()
+    default_sender = next(iter(AGENT_MAPPING))
+    sender_id = body.get("sender_id", default_sender)
+    config = {"configurable": {"thread_id": sender_id}}
+    beverage_agent.update_state(config, {"chat_history": [], "observations": {}, "next_tasks": []})
+    return {"reset": True, "sender_id": sender_id}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=9999)

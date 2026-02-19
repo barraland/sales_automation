@@ -1,4 +1,5 @@
 import os
+import csv
 import json
 import logging
 import sqlite3
@@ -66,6 +67,20 @@ brand_values = facets.get("brand", [])
 categoria_values = facets.get("categoria", [])
 
 # =============================================================================
+# ANAGRAFICA AGENTI (caricata da data/agenti.csv)
+# =============================================================================
+_project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_agenti_csv = os.path.join(_project_root, "data", "agenti.csv")
+agent_email_map: Dict[str, str] = {}   # codice → email
+if os.path.exists(_agenti_csv):
+    with open(_agenti_csv, newline="", encoding="utf-8") as _f:
+        for _row in csv.DictReader(_f):
+            agent_email_map[_row["codice"]] = _row["email"]
+    print(f"✅ Agenti caricati: {list(agent_email_map.keys())}")
+else:
+    print(f"⚠️ File agenti non trovato: {_agenti_csv}")
+
+# =============================================================================
 # SCHEMI E STATO
 # =============================================================================
 from typing import List, Union, Optional, Literal
@@ -91,6 +106,7 @@ class SearchProductArgs(BaseModel):
     query: str
     filters_json: str = ""
     top_k: int = 10
+    info_only: bool = False  # True per domande informative sul catalogo (non aggiunta al carrello)
 
 class OrderArgs(BaseModel):
     action: Literal["insert_order", "list_orders"]
@@ -98,6 +114,14 @@ class OrderArgs(BaseModel):
     date_from: Optional[str] = None      # ISO datetime: "YYYY-MM-DD HH:MM:SS"
     date_to: Optional[str] = None        # ISO datetime: "YYYY-MM-DD HH:MM:SS"
     status_filter: Optional[str] = None  # es. "RECEIVED"
+
+class CatalogArgs(BaseModel):
+    action: Literal["list_brands", "list_categories", "list_brands_by_category"]
+    categoria: Optional[str] = None      # obbligatorio per list_brands_by_category
+
+class ClarifyArgs(BaseModel):
+    intent: Literal["explain_capabilities", "out_of_scope"]
+    detail: Optional[str] = None  # cosa ha chiesto l'utente che è fuori scope
 
 # =============================================================================
 # TASK E PIANO
@@ -109,8 +133,10 @@ class Task(BaseModel):
         "search_product",
         "manage_cart",
         "manage_orders",
+        "manage_catalog",
+        "clarify",
     ]
-    args: Union[SearchClientArgs, CartArgs, SearchProductArgs, OrderArgs]
+    args: Union[SearchClientArgs, CartArgs, SearchProductArgs, OrderArgs, CatalogArgs, ClarifyArgs]
     deps: List[str] = Field(default_factory=list)  # ID task da completare prima
     status: Literal["pending", "success", "failed"] = "pending"
 
@@ -176,11 +202,11 @@ class ExecutionContext(BaseModel):
 # =============================================================================
 # EMAIL CONFERMA ORDINE
 # =============================================================================
-def send_order_email(order_result: dict, known_clients: dict) -> bool:
+def send_order_email(order_result: dict, known_clients: dict, agent_code: str = "") -> bool:
     """
     Invia una email di conferma ordine via Gmail SMTP (App Password).
-    Legge GMAIL_FROM e GMAIL_APP_PASSWORD dal .env.
-    L'email viene inviata all'agente stesso come ricevuta/conferma.
+    Il mittente è GMAIL_FROM (.env); il destinatario è l'email dell'agente
+    letta da data/agenti.csv tramite agent_email_map.
     """
     gmail_from = os.getenv("GMAIL_FROM", "")
     gmail_password = os.getenv("GMAIL_APP_PASSWORD", "")
@@ -188,6 +214,8 @@ def send_order_email(order_result: dict, known_clients: dict) -> bool:
     if not gmail_from or not gmail_password:
         print("⚠️ GMAIL_FROM o GMAIL_APP_PASSWORD non configurati — email non inviata")
         return False
+
+    agent_to = agent_email_map.get(agent_code, gmail_from)
 
     order_id = order_result.get("order_id")
     client_id = order_result.get("client_id", "")
@@ -220,13 +248,13 @@ def send_order_email(order_result: dict, known_clients: dict) -> bool:
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = f"Ordine #{order_id} confermato — {client_name}"
     msg["From"] = gmail_from
-    msg["To"] = gmail_from  # self-confirmation all'agente
+    msg["To"] = agent_to
 
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_from, gmail_password)
-            smtp.sendmail(gmail_from, [gmail_from], msg.as_string())
-        print(f"✅ Email ordine #{order_id} inviata a {gmail_from}")
+            smtp.sendmail(gmail_from, [agent_to], msg.as_string())
+        print(f"✅ Email ordine #{order_id} inviata a {agent_to} (agente {agent_code})")
         return True
     except Exception as e:
         print(f"❌ Errore invio email: {e}")
@@ -492,11 +520,42 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 - Cerca il client_id di un cliente non ancora noto nel database.
 - NON usare se il client_id è già in "Lista clienti già risolti".
 
-2️⃣ **search_product** — args: SearchProductArgs(placeholder, query, filters_json, top_k)
-- Cerca lo sku di un prodotto non ancora noto (ricerca semantica RAG).
-- top_k: usa 10 per ricerche puntuali.
-- NON usare se lo sku è già in "Lista prodotti già risolti".
-- NON dipende mai da search_client — cliente e prodotto si cercano sempre in parallelo.
+2️⃣ **search_product** — args: SearchProductArgs(placeholder, query, filters_json, top_k, info_only)
+
+  **Modalità RISOLUZIONE SKU** (info_only=False, default):
+  - Cerca lo sku di un prodotto non ancora noto per poi aggiungerlo al carrello.
+  - NON usare se lo sku è già in "Lista prodotti già risolti".
+  - NON dipende mai da search_client — cliente e prodotto si cercano sempre in parallelo.
+  - top_k: 10 per ricerche puntuali.
+
+  **Modalità INFO CATALOGO** (info_only=True):
+  - Usa quando l'utente chiede informazioni sui prodotti senza volerli ordinare:
+    "che brand avete?", "avete la Heineken?", "quali birre sono disponibili?",
+    "quant'è il prezzo della Peroni 33cl?", "mostratemi le acque a catalogo".
+  - Questo task è STANDALONE: NON creare task manage_cart collegati.
+    Il responder mostrerà direttamente i risultati all'utente.
+  - placeholder: usa una stringa descrittiva es. "INFO_HEINEKEN", "INFO_BIRRE", "INFO_BRAND".
+  - top_k: scegli in base all'ampiezza della richiesta:
+      • 10  — prodotto specifico ("avete la Peroni 33cl?")
+      • 20  — tutti i prodotti di un brand ("prodotti Heineken")
+      • 50  — query per categoria o sottocategoria ("tutte le birre", "le acque")
+      • 100 — query molto ampie ("tutto il catalogo alcolici", "mostrami tutto")
+    Nota: top_k è un massimo — se il catalogo contiene meno prodotti corrispondenti,
+    ne vengono restituiti semplicemente meno.
+  - Per domande su brand disponibili o categorie disponibili, usa stringa vuota come query
+    e imposta il filtro appropriato.
+
+  **Filtri disponibili** (filters_json = stringa JSON, stringa vuota = nessun filtro):
+  - Per brand:     {{"brand": "Heineken"}}
+  - Per categoria: {{"categoria": "Alcolici"}}
+  - Combinati:     {{"brand": "Heineken", "categoria": "Alcolici"}}
+  - ⚠️ Usa ESATTAMENTE i valori dalle liste seguenti (rispetta maiuscole, apostrofi, spazi):
+
+  Brand ammessi:
+  {json.dumps(brand_values, ensure_ascii=False)}
+
+  Categorie ammesse:
+  {json.dumps(categoria_values, ensure_ascii=False)}
 
 3️⃣ **manage_cart** — args: CartArgs(action, client_id, sku, quantity)
 - action: "add" | "remove" | "view" | "clear"
@@ -531,6 +590,29 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
     Per "ultimi N minuti": calcola sottraendo N minuti da current_datetime
   - status_filter: "RECEIVED" (default), "SHIPPED", etc.
 - Non dipende da manage_cart.
+
+5️⃣ **manage_catalog** — args: CatalogArgs(action, categoria)
+- Usa questo tool SOLO per domande esplicite sul catalogo: "quali brand hai?", "che categorie ci sono?",
+  "quali brand di birra hai?", "dimmi i produttori di vino". NON usarlo per ricerche di prodotti specifici.
+- action: "list_brands" | "list_categories" | "list_brands_by_category"
+- **list_brands**: restituisce tutti i brand del catalogo. Nessun parametro aggiuntivo. Deps: vuoti.
+- **list_categories**: restituisce tutte le categorie. Nessun parametro aggiuntivo. Deps: vuoti.
+- **list_brands_by_category**: restituisce i brand che hanno prodotti nella categoria indicata.
+  Richiede `categoria` (valore esatto da categoria_values). Deps: vuoti.
+- Non ha dipendenze da altri task.
+
+6️⃣ **clarify** — args: ClarifyArgs(intent, detail)
+- Usa questo tool quando NON devi eseguire operazioni su catalogo/carrello/ordini.
+- intent: "explain_capabilities" | "out_of_scope"
+- **explain_capabilities**: l'utente chiede cosa sa fare l'assistente ("cosa puoi fare?",
+  "come funzioni?", "a cosa servi?"), oppure mostra incertezza su cosa è possibile chiedere
+  ("posso chiederti di...?", "sai anche...?"). Nessun `detail`. Deps: vuoti.
+- **out_of_scope**: l'utente chiede qualcosa completamente estraneo al dominio commerciale
+  bevande (es. meteo, notizie, codice, ricette, sport). Compila `detail` con una breve
+  descrizione di cosa ha chiesto (es. "previsioni meteo"). Deps: vuoti.
+- ⚠️ NON usare clarify se la richiesta è solo ambigua o incompleta: in quel caso il responder
+  chiede chiarimenti da solo. Usalo SOLO per i due casi sopra.
+- clarify è sempre standalone: non combinarlo con altri tool nello stesso piano.
 
 ----------------------------------------------------------------------
 📌 REGOLE DI PIANIFICAZIONE
@@ -575,6 +657,10 @@ client_id e sku sono già noti prima di pianificare ricerche.
         plan = plan_adapter.validate_python(plan_raw)
 
         print(f"DEBUG PLANNER: tasks_count={len(plan.tasks)}")
+        for t in plan.tasks:
+            args_repr = {k: v for k, v in t.args.__dict__.items() if v is not None and v != "" and v != []}
+            print(f"   ├─ [{t.id}] tool={t.tool} deps={t.deps}")
+            print(f"   │   args={args_repr}")
 
         return {
         "next_tasks": plan.tasks,
@@ -697,8 +783,18 @@ def executor_node(state: AgentState):
                 # SEARCH PRODUCT
                 # -----------------------------------------------------------------
                 elif task.tool == "search_product":
+                    # Se query è vuota ma c'è un filtro brand/categoria, usa il valore
+                    # del filtro come query per evitare il fallback generico "bevande"
+                    search_query = task.args.query
+                    if not search_query and task.args.filters_json:
+                        try:
+                            filter_dict = json.loads(task.args.filters_json)
+                            search_query = filter_dict.get("brand") or filter_dict.get("categoria") or ""
+                        except Exception:
+                            pass
+
                     raw = search_product_smart.invoke({
-                        "query": task.args.query,
+                        "query": search_query,
                         "planner_motivation": "",
                         "filters_json": task.args.filters_json,
                         "top_k": task.args.top_k,
@@ -706,10 +802,22 @@ def executor_node(state: AgentState):
                     # Il tool restituisce {"results": [...], "metadata": {...}}
                     results = raw.get("results", []) if isinstance(raw, dict) else []
 
+                    # Log risultati RAG
+                    if results:
+                        print(f" 📦 RAG: {len(results)} prodotti trovati:")
+                        for r in results[:8]:
+                            price_str = f"€{r['prezzo']:.2f}" if r.get("prezzo") else "—"
+                            stock_str = f"disp:{r.get('stock')}" if r.get("stock") is not None else ""
+                            print(f"    • {r.get('sku')} | {r.get('brand')} {r.get('formato')} | {price_str} {stock_str}".rstrip())
+                        if len(results) > 8:
+                            print(f"    ... +{len(results)-8} altri")
+                    else:
+                        print(f" ⚠️ RAG: nessun risultato | query={search_query!r} filter={task.args.filters_json!r}")
+
                     if not results:
                         task.status = "failed"
-                        obs[task.id] = {"error": f"Nessun prodotto trovato per '{task.args.query}'"}
-                        print(f" ❌ Nessun prodotto trovato: {task.args.query}")
+                        obs[task.id] = {"error": f"Nessun prodotto trovato per '{search_query}'"}
+                        print(f" ❌ Nessun prodotto trovato: {search_query}")
                     else:
                         # Aggiorna known_products con tutti i risultati trovati
                         for r in results:
@@ -723,7 +831,12 @@ def executor_node(state: AgentState):
                                     "stock": r.get("stock"),
                                 }
 
-                        if len(results) == 1 and getattr(task.args, "placeholder", None):
+                        if getattr(task.args, "info_only", False):
+                            # Query informativa sul catalogo — mostra tutti i risultati senza disambiguazione
+                            obs[task.id] = {"results": results, "info_only": True}
+                            task.status = "success"
+                            print(f" ℹ️ Info catalogo: {len(results)} prodotti trovati")
+                        elif len(results) == 1 and getattr(task.args, "placeholder", None):
                             # Risolto univocamente
                             resolved_sku = results[0].get("sku")
                             placeholder_map[task.args.placeholder] = resolved_sku
@@ -756,7 +869,7 @@ def executor_node(state: AgentState):
                                 obs[task.id] = res
                                 task.status = "success" if "order_id" in res else "failed"
                                 if task.status == "success":
-                                    send_order_email(res, updated_known_clients)
+                                    send_order_email(res, updated_known_clients, agent_code=agent_code)
 
                         elif task.args.action == "list_orders":
                             res = sql_list_orders(agent_code=agent_code, args=task.args)
@@ -812,6 +925,57 @@ def executor_node(state: AgentState):
                         else:
                             print(" ❌ Errore operazione carrello")
                             task.status = "failed"
+
+                # -----------------------------------------------------------------
+                # MANAGE CATALOG
+                # -----------------------------------------------------------------
+                elif task.tool == "manage_catalog":
+                    action = task.args.action
+                    print(f" 📚 Catalog action: {action} | categoria={getattr(task.args, 'categoria', None)}")
+
+                    if action == "list_brands":
+                        obs[task.id] = {"brands": brand_values, "catalog_info": True}
+                        task.status = "success"
+                        print(f"   ✅ {len(brand_values)} brand restituiti dalla cache")
+
+                    elif action == "list_categories":
+                        obs[task.id] = {"categories": categoria_values, "catalog_info": True}
+                        task.status = "success"
+                        print(f"   ✅ {len(categoria_values)} categorie restituite dalla cache")
+
+                    elif action == "list_brands_by_category":
+                        cat = getattr(task.args, "categoria", None)
+                        if not cat:
+                            obs[task.id] = {"error": "categoria obbligatoria per list_brands_by_category"}
+                            task.status = "failed"
+                        else:
+                            escaped_cat = cat.replace("'", "''")
+                            odata = f"categoria eq '{escaped_cat}'"
+                            facet_result = get_catalog_facets(
+                                facet_fields=["brand"],
+                                odata_filter=odata
+                            )
+                            brands_in_cat = facet_result.get("brand", [])
+                            obs[task.id] = {
+                                "brands": brands_in_cat,
+                                "categoria": cat,
+                                "catalog_info": True
+                            }
+                            task.status = "success"
+                            print(f"   ✅ {len(brands_in_cat)} brand nella categoria '{cat}'")
+                    else:
+                        obs[task.id] = {"error": f"Azione catalog non riconosciuta: {action}"}
+                        task.status = "failed"
+
+                # -----------------------------------------------------------------
+                # CLARIFY
+                # -----------------------------------------------------------------
+                elif task.tool == "clarify":
+                    intent = task.args.intent
+                    detail = getattr(task.args, "detail", None)
+                    obs[task.id] = {"clarify": True, "intent": intent, "detail": detail}
+                    task.status = "success"
+                    print(f" 💬 Clarify: intent={intent}" + (f" | detail={detail}" if detail else ""))
 
                 else:
                     print(f" ⚠️ TOOL NON RICONOSCIUTO: {task.tool}")
@@ -962,7 +1126,7 @@ def responder_node(state: AgentState):
     # Regole dinamiche carrello
     cart_rules = ""
     if is_cart_view and cart_client_name:
-        cart_rules += f"\n13. Inizia la risposta sul carrello con 'Carrello di {cart_client_name}:' prima di elencare i prodotti."
+        cart_rules += f"\n18. Inizia la risposta sul carrello con 'Carrello di {cart_client_name}:' prima di elencare i prodotti."
     if is_cart_mutated:
         nome = f"di {cart_client_name}" if cart_client_name else ""
         if cart_after_mutation:
@@ -979,13 +1143,13 @@ def responder_node(state: AgentState):
                 for r in cart_after_mutation
             )
             cart_rules += (
-                f"\n14. Dopo aver confermato l'operazione, riporta il seguente riepilogo carrello {nome} "
+                f"\n19. Dopo aver confermato l'operazione, riporta il seguente riepilogo carrello {nome} "
                 f"(già formattato, copialo senza modifiche):\n"
                 f"{cart_summary}\n"
                 f"Poi chiedi: 'Vuoi confermare e inviare l'ordine?'"
             )
         else:
-            cart_rules += f"\n14. Dopo aver confermato l'operazione, chiedi: 'Vuoi confermare e inviare l'ordine?'"
+            cart_rules += f"\n19. Dopo aver confermato l'operazione, chiedi: 'Vuoi confermare e inviare l'ordine?'"
 
     # 4️⃣ System grounding (vincola il modello ai fatti reali)
     system_msg = f"""
@@ -1028,7 +1192,28 @@ REGOLE MANDATORIE:
     Chiedi esplicitamente quante unità vuole aggiungere, usando il nome del prodotto (non lo SKU).
 13. Se nelle osservazioni trovi {{"error": "client_required"}}, il cliente non era specificato.
     Chiedi esplicitamente: "Per quale cliente vuoi [action] il carrello?"
-14. {"ORDINE CONFERMATO — usa solo queste informazioni per rispondere:" if confirmed_order else ""}
+14. Se nelle osservazioni trovi {{"info_only": true, "results": [...]}}, stai rispondendo a una
+    domanda informativa sul catalogo. Mostra i prodotti trovati in un elenco chiaro:
+    per ogni voce mostra **nome/brand**, formato, prezzo unitario (€), disponibilità (pz).
+    NON proporre di aggiungere al carrello a meno che l'utente non lo abbia richiesto.
+    Se results è vuoto, rispondi che non ci sono prodotti corrispondenti.
+15. Se nelle osservazioni trovi {{"catalog_info": true, "brands": [...]}}, mostra l'elenco dei brand
+    in modo leggibile (es. divisi per lettera iniziale o in lista semplice). Se è presente anche
+    "categoria", contestualizza: "Brand disponibili nella categoria X: ...".
+    Se trovi {{"catalog_info": true, "categories": [...]}}, mostra le categorie disponibili.
+    NON proporre prodotti specifici, NON chiedere se vuole aggiungere al carrello.
+16. Se nelle osservazioni trovi {{"clarify": true, "intent": "explain_capabilities"}}, spiega cosa
+    sai fare in modo conciso e amichevole, adatto a WhatsApp. Elenca le funzionalità principali:
+    - Cercare clienti per nome o ragione sociale
+    - Gestire il carrello: aggiungere, rimuovere, visualizzare e svuotare prodotti
+    - Consultare il catalogo: cercare prodotti, vedere brand e categorie disponibili
+    - Confermare e inviare ordini
+    - Consultare lo storico degli ordini
+    Concludi con un invito a chiedere ("Cosa vuoi fare?").
+    Se trovi {{"clarify": true, "intent": "out_of_scope", "detail": "..."}}, rispondi con
+    gentilezza che quella richiesta è fuori dal tuo ambito (menziona il `detail` se utile) e
+    ricorda brevemente a cosa servi, invitando a chiedere qualcosa sul catalogo o sugli ordini.
+17. {"ORDINE CONFERMATO — usa solo queste informazioni per rispondere:" if confirmed_order else ""}
     {f"Ordine #{confirmed_order['order_id']} confermato per {confirmed_order.get('client_id', '')}. Totale: €{confirmed_order.get('total', 0):.2f} ({confirmed_order.get('items_count', 0)} prodotti). Rispondi con un messaggio di conferma chiaro, includi il numero ordine." if confirmed_order else ""}
     {"NON chiedere di nuovo se vuole confermare — l'ordine è già stato creato." if confirmed_order else ""}{cart_rules if not confirmed_order else ""}
 """
