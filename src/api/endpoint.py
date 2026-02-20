@@ -4,13 +4,14 @@ import requests
 import csv
 import json
 import os
+import sqlite3
 import tempfile
 from datetime import datetime
 from fastapi import FastAPI, Request, Response, BackgroundTasks
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import PlainTextResponse, JSONResponse
 from langchain_core.messages import HumanMessage, AIMessage
 from openai import OpenAI
-from src.graph.graph_app import create_graph
+from src.graph.graph_app import create_graph, agent_name_map
 
 app = FastAPI(title="Beverage Agent API")
 beverage_agent = create_graph()
@@ -32,6 +33,82 @@ if os.path.exists(_agenti_csv):
 else:
     print(f"⚠️ File agenti non trovato: {_agenti_csv} — nessun agente mappato")
 
+# =============================================================================
+# LOGGING SU SQLITE
+# =============================================================================
+_LOG_DB = os.path.join(_project_root, "sql_lite", "db", "database_ordini.db")
+
+def _init_log_table():
+    conn = sqlite3.connect(_LOG_DB)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            sender_id   TEXT    NOT NULL,
+            agent_code  TEXT    NOT NULL,
+            user_msg    TEXT,
+            plan_json   TEXT,
+            obs_json    TEXT,
+            response    TEXT,
+            duration_ms INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+_init_log_table()
+
+
+def _log_turn(
+    sender_id: str,
+    agent_code: str,
+    user_msg: str,
+    result: dict,
+    answer,
+    duration_ms: int,
+):
+    """Scrive un record di log per ogni turno di conversazione."""
+    try:
+        # Serializza piano (next_tasks) e observations
+        raw_tasks = result.get("next_tasks", [])
+        plan_list = []
+        for t in raw_tasks:
+            if hasattr(t, "model_dump"):
+                plan_list.append(t.model_dump())
+            elif hasattr(t, "__dict__"):
+                plan_list.append(t.__dict__)
+            else:
+                plan_list.append(t)
+
+        obs = result.get("observations", {})
+
+        conn = sqlite3.connect(_LOG_DB)
+        conn.execute(
+            """
+            INSERT INTO conversation_log
+                (ts, sender_id, agent_code, user_msg, plan_json, obs_json, response, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                sender_id,
+                agent_code,
+                user_msg,
+                json.dumps(plan_list, ensure_ascii=False, default=str),
+                json.dumps(obs,       ensure_ascii=False, default=str),
+                answer.text if hasattr(answer, "text") else str(answer),
+                duration_ms,
+            ),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Errore log DB: {e}")
+
+
+# =============================================================================
+# TRASCRIZIONE AUDIO
+# =============================================================================
 def transcribe_audio(media_id: str) -> str | None:
     """
     Scarica il vocale WhatsApp (OGG/Opus) e lo trascrive con OpenAI Whisper.
@@ -95,13 +172,15 @@ def transcribe_and_process(sender_id: str, media_id: str):
     if text:
         process_and_respond(sender_id, text)
     else:
-        # Notifica l'utente che la trascrizione è fallita
         class _Msg:
             use_interactive_list = False
             text = "❌ Non sono riuscito a trascrivere il messaggio vocale. Puoi riscriverlo?"
         send_whatsapp_message(sender_id, _Msg())
 
 
+# =============================================================================
+# PIPELINE PRINCIPALE
+# =============================================================================
 def run_graph(sender_id: str, user_text: str):
     """
     Cuore della pipeline: esegue il grafo e restituisce l'oggetto FinalAnswer.
@@ -118,23 +197,30 @@ def run_graph(sender_id: str, user_text: str):
         else getattr(state_values, "chat_history", [])
     )
 
+    agent_info = agent_name_map.get(agent_code, {})
     inputs = {
         "question": user_text,
         "chat_history": history,
         "observations": {},
         "agent_code": agent_code,
+        "agent_nome": agent_info.get("nome", ""),
+        "agent_cognome": agent_info.get("cognome", ""),
         "is_finished": False,
         "next_tasks": [],
         "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
+    t0 = datetime.now()
     result = beverage_agent.invoke(inputs, config=config)
+    duration_ms = int((datetime.now() - t0).total_seconds() * 1000)
 
     answer = result.get("final_answer", "Non ho trovato informazioni specifiche.")
     history_text = answer.text if hasattr(answer, "text") else str(answer)
     new_history = history + [HumanMessage(content=user_text), AIMessage(content=history_text)]
 
     beverage_agent.update_state(config, {"chat_history": new_history})
+
+    _log_turn(sender_id, agent_code, user_text, result, answer, duration_ms)
 
     return answer
 
@@ -148,26 +234,26 @@ def process_and_respond(sender_id: str, user_text: str):
     answer = run_graph(sender_id, user_text)
     send_whatsapp_message(sender_id, answer)
 
+
+# =============================================================================
+# WHATSAPP SENDER
+# =============================================================================
 def send_whatsapp_message(to: str, content):
-    """
-    Funzione universale Meta Cloud API.
-    """
+    """Funzione universale Meta Cloud API."""
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
     headers = {
-        "Authorization": f"Bearer {TOKEN}", 
+        "Authorization": f"Bearer {TOKEN}",
         "Content-Type": "application/json"
     }
-    
-    # 1. CASO LISTA INTERATTIVA
+
     if hasattr(content, 'use_interactive_list') and content.use_interactive_list:
         rows = []
         for item in content.items[:10]:
             rows.append({
                 "id": item.id,
-                "title": item.title[:24], 
+                "title": item.title[:24],
                 "description": (item.description[:72] if item.description else "")
             })
-        
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -184,14 +270,10 @@ def send_whatsapp_message(to: str, content):
                 }
             }
         }
-    
-    # 2. CASO TESTO SEMPLICE
     else:
         text_body = content.text if hasattr(content, 'text') else str(content)
-        # Protezione caratteri per Meta
         if len(text_body) > 4000:
             text_body = text_body[:3997] + "..."
-            
         payload = {
             "messaging_product": "whatsapp",
             "to": to,
@@ -208,6 +290,10 @@ def send_whatsapp_message(to: str, content):
     except Exception as e:
         print(f"❌ Errore connessione: {e}")
 
+
+# =============================================================================
+# WEBHOOK WHATSAPP
+# =============================================================================
 @app.post("/whatsapp")
 async def webhook(request: Request, background_tasks: BackgroundTasks):
     data = await request.json()
@@ -218,25 +304,21 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 if "messages" in value:
                     for msg in value["messages"]:
                         sender = msg["from"]
-                        
                         if msg["type"] == "text":
                             text = msg["text"]["body"]
                             background_tasks.add_task(process_and_respond, sender, text)
-                        
                         elif msg["type"] == "interactive":
-                            # Se l'utente seleziona un cliente dalla lista
                             selection_id = msg["interactive"]["list_reply"]["id"]
                             selection_title = msg["interactive"]["list_reply"]["title"]
                             fake_text = f"Ho selezionato: {selection_title} (ID: {selection_id})"
                             background_tasks.add_task(process_and_respond, sender, fake_text)
-
                         elif msg["type"] == "audio":
                             media_id = msg["audio"]["id"]
                             background_tasks.add_task(transcribe_and_process, sender, media_id)
-                            
     except Exception as e:
         print(f"⚠️ Errore parsing webhook: {e}")
     return {"status": "ok"}
+
 
 @app.get("/whatsapp")
 async def verify(request: Request):
@@ -245,21 +327,18 @@ async def verify(request: Request):
         return PlainTextResponse(content=p.get("hub.challenge"))
     return Response(content="Forbidden", status_code=403)
 
+
+# =============================================================================
+# ENDPOINT DI TEST
+# =============================================================================
 @app.post("/test/chat")
 async def test_chat(request: Request):
-    """
-    Endpoint per test locale. Chiama run_graph() sincronamente e ritorna
-    la risposta come JSON — niente chiamate WhatsApp/Meta.
-
-    Body: {"sender_id": "393755116724", "text": "..."}
-    sender_id opzionale: default al primo agente mappato (AG001).
-    """
     body = await request.json()
     text = body.get("text", "").strip()
     if not text:
         return {"error": "Campo 'text' obbligatorio"}
 
-    default_sender = next(iter(AGENT_MAPPING))  # primo sender → AG001
+    default_sender = next(iter(AGENT_MAPPING))
     sender_id = body.get("sender_id", default_sender)
 
     answer = run_graph(sender_id, text)
@@ -275,16 +354,98 @@ async def test_chat(request: Request):
 
 @app.delete("/test/chat")
 async def test_reset(request: Request):
-    """
-    Resetta la chat history di un sender (pulisce il checkpoint SQLite).
-    Body: {"sender_id": "393755116724"}  — opzionale, default AG001.
-    """
     body = await request.json()
     default_sender = next(iter(AGENT_MAPPING))
     sender_id = body.get("sender_id", default_sender)
     config = {"configurable": {"thread_id": sender_id}}
     beverage_agent.update_state(config, {"chat_history": [], "observations": {}, "next_tasks": []})
     return {"reset": True, "sender_id": sender_id}
+
+
+# =============================================================================
+# ENDPOINT ADMIN LOG
+# =============================================================================
+@app.get("/admin/logs")
+async def get_logs(
+    agent: str = None,
+    sender: str = None,
+    date: str = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """
+    Legge i log di conversazione dal DB.
+
+    Query params:
+      agent=AG001          filtra per codice agente
+      sender=393755116724  filtra per numero di telefono
+      date=2026-02-20      filtra per data (prefisso su ts)
+      limit=50             numero massimo di righe (max 200)
+      offset=0             paginazione
+    """
+    limit = min(limit, 200)
+
+    conditions = []
+    params = []
+    if agent:
+        conditions.append("agent_code = ?")
+        params.append(agent)
+    if sender:
+        conditions.append("sender_id = ?")
+        params.append(sender)
+    if date:
+        conditions.append("ts LIKE ?")
+        params.append(f"{date}%")
+
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params += [limit, offset]
+
+    try:
+        conn = sqlite3.connect(_LOG_DB)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            f"""
+            SELECT id, ts, sender_id, agent_code, user_msg,
+                   plan_json, obs_json, response, duration_ms
+            FROM conversation_log
+            {where}
+            ORDER BY id DESC
+            LIMIT ? OFFSET ?
+            """,
+            params,
+        ).fetchall()
+        conn.close()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+    result = []
+    for r in rows:
+        entry = dict(r)
+        # Deserializza JSON inline per renderli navigabili
+        for field in ("plan_json", "obs_json"):
+            try:
+                entry[field] = json.loads(entry[field]) if entry[field] else None
+            except Exception:
+                pass
+        result.append(entry)
+
+    return {"total": len(result), "offset": offset, "logs": result}
+
+
+@app.delete("/admin/logs")
+async def clear_logs(agent: str = None):
+    """Svuota i log. Se agent= specificato, solo quell'agente."""
+    try:
+        conn = sqlite3.connect(_LOG_DB)
+        if agent:
+            conn.execute("DELETE FROM conversation_log WHERE agent_code = ?", (agent,))
+        else:
+            conn.execute("DELETE FROM conversation_log")
+        conn.commit()
+        conn.close()
+        return {"cleared": True, "agent": agent or "all"}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
 
 
 if __name__ == "__main__":

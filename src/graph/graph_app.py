@@ -71,11 +71,17 @@ categoria_values = facets.get("categoria", [])
 # =============================================================================
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 _agenti_csv = os.path.join(_project_root, "data", "agenti.csv")
-agent_email_map: Dict[str, str] = {}   # codice → email
+agent_email_map: Dict[str, str] = {}          # codice → email
+agent_name_map: Dict[str, Dict[str, str]] = {} # codice → {nome, cognome}
 if os.path.exists(_agenti_csv):
     with open(_agenti_csv, newline="", encoding="utf-8") as _f:
         for _row in csv.DictReader(_f):
-            agent_email_map[_row["codice"]] = _row["email"]
+            codice = _row["codice"]
+            agent_email_map[codice] = _row["email"]
+            agent_name_map[codice] = {
+                "nome":    _row.get("nome", ""),
+                "cognome": _row.get("cognome", ""),
+            }
     print(f"✅ Agenti caricati: {list(agent_email_map.keys())}")
 else:
     print(f"⚠️ File agenti non trovato: {_agenti_csv}")
@@ -157,6 +163,8 @@ class FinalResponse(BaseModel):
 
 class AgentState(BaseModel):
     agent_code: str
+    agent_nome: str = ""
+    agent_cognome: str = ""
     known_clients: Dict[str, Any] = {}
     known_products: Dict[str, Any] = {}
     cart: Dict[str, Any] = {}
@@ -481,6 +489,7 @@ def planner_node(state: AgentState):
     known_clients = getattr(state, "known_clients", {})
     known_products = getattr(state, "known_products", {})
     current_datetime = getattr(state, "current_datetime", "N/D")
+    is_first_message = len(getattr(state, "chat_history", [])) == 0
 
     system_prompt = f"""
 Sei un assistente virtuale per agenti commerciali che servono e riforniscono clienti per il settore Horeca.
@@ -630,6 +639,9 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 
 Data e ora corrente (usala per calcolare filtri temporali): {current_datetime}
 
+{"⭐ PRIMO MESSAGGIO DELLA SESSIONE: la chat history è vuota." if is_first_message else ""}
+{"Se il messaggio non è una richiesta operativa specifica (es. 'ciao', 'prova', 'salve', 'chi sei', domanda generica), pianifica clarify(intent='explain_capabilities'). Se invece è una richiesta specifica (aggiungere prodotti, vedere catalogo, ecc.), eseguila normalmente." if is_first_message else ""}
+
 Lista clienti già risolti (usa direttamente, SENZA search_client):
 {json.dumps(known_clients, indent=2, ensure_ascii=False)}
 
@@ -703,6 +715,32 @@ def executor_node(state: AgentState):
     # Copie mutabili delle mappe note, da restituire nello stato
     updated_known_clients = dict(getattr(state, "known_clients", {}))
     updated_known_products = dict(getattr(state, "known_products", {}))
+
+    # Lookup preventivo: per ogni client_id reale nei task non ancora in known_clients,
+    # carica nome/ragione_sociale dal DB così il responder può usarlo senza ambiguità.
+    _missing_client_ids = {
+        getattr(t.args, "client_id", None)
+        for t in tasks
+        if getattr(t.args, "client_id", None)
+        and not str(getattr(t.args, "client_id", "")).startswith("ph_")
+        and getattr(t.args, "client_id", None) not in updated_known_clients
+    }
+    if _missing_client_ids:
+        try:
+            _db = _get_db_path()
+            _conn = sqlite3.connect(_db)
+            _conn.row_factory = sqlite3.Row
+            for _cid in _missing_client_ids:
+                _row = _conn.execute(
+                    "SELECT client_id, ragione_sociale, alias, citta FROM clienti_fts WHERE client_id=?",
+                    (_cid,)
+                ).fetchone()
+                if _row:
+                    updated_known_clients[_cid] = dict(_row)
+                    print(f"   🔍 Client lookup: {_cid} → {_row['ragione_sociale']}")
+            _conn.close()
+        except Exception as _e:
+            print(f"   ⚠️ Client lookup error: {_e}")
 
     updated_tasks = tasks.copy()
 
@@ -987,8 +1025,16 @@ def executor_node(state: AgentState):
             task.status = "failed"
 
     # -------------------------------------------------------------------------
-    # OUTPUT
+    # OUTPUT — trim cache FIFO (mantieni solo gli ultimi N inseriti)
     # -------------------------------------------------------------------------
+    if len(updated_known_clients) > 20:
+        updated_known_clients = dict(list(updated_known_clients.items())[-20:])
+        print(f" ✂️  known_clients trimmato a 20")
+
+    if len(updated_known_products) > 50:
+        updated_known_products = dict(list(updated_known_products.items())[-50:])
+        print(f" ✂️  known_products trimmato a 50")
+
     output_to_state = {
         "observations": obs,
         "next_tasks": updated_tasks,
@@ -1152,9 +1198,18 @@ def responder_node(state: AgentState):
             cart_rules += f"\n19. Dopo aver confermato l'operazione, chiedi: 'Vuoi confermare e inviare l'ordine?'"
 
     # 4️⃣ System grounding (vincola il modello ai fatti reali)
+    agent_nome = getattr(state, "agent_nome", "") or ""
+    is_first_message = len(getattr(state, "chat_history", [])) == 0
+
     system_msg = f"""
 Sei un assistente commerciale per WhatsApp.
 Il tuo compito è riferire SOLO ciò che è stato effettivamente eseguito dai tool.
+Stai parlando con l'agente: {agent_nome or "l'agente"}.
+Usa il suo nome ({agent_nome}) SOLO in questi momenti — mai altrove:
+  1. Quando pianificato clarify(explain_capabilities) al primo messaggio (regola 16).
+  2. Ordine confermato: includi il nome nella conferma ("Ordine inviato, {agent_nome}. Totale...").
+  3. Situazione critica o errore che richiede attenzione: menzionalo una volta per empatia.
+In tutti gli altri messaggi rispondi in modo diretto ed efficiente, SENZA usare il nome.
 
 STATO REALE (Fonte di Verità):
 - Prodotti/clienti aggiunti al DB: {"SÌ" if was_added else "NO"}
@@ -1166,9 +1221,14 @@ Mappa clienti (usa ragione_sociale per riferirsi ai clienti):
 
 REGOLE MANDATORIE:
 
+⚠️ REGOLA FONDAMENTALE: Se 'Prodotti/clienti aggiunti al DB' è SÌ, le operazioni sul carrello
+sono ANDATE A BUON FINE. In questo caso NON produrre MAI messaggi come "non ho trovato il cliente",
+"per quale cliente?", "non riesco a trovare". Stai confermando operazioni già eseguite, non cercando
+dati. Usa la mappa clienti sopra per tradurre client_id in nome leggibile.
+
 1. NON DIRE MAI "Ho aggiunto al carrello" se 'Prodotti aggiunti al DB' è NO.
-2. Se l'operazione è fallita perché manca il cliente,
-   chiedi: "Per quale cliente vuoi ordinare?"
+2. SOLO SE 'Prodotti/clienti aggiunti al DB' è NO e nelle osservazioni c'è {{"error": "client_required"}}:
+   chiedi "Per quale cliente vuoi ordinare?"
 3. Se c'è ESATTAMENTE UN risultato con 'pending_selection: true' (clienti o prodotti),
    usa use_interactive_list=True per elencare le opzioni.
 4. Se ci sono DUE O PIÙ risultati con 'pending_selection: true', NON usare la lista
@@ -1202,14 +1262,15 @@ REGOLE MANDATORIE:
     "categoria", contestualizza: "Brand disponibili nella categoria X: ...".
     Se trovi {{"catalog_info": true, "categories": [...]}}, mostra le categorie disponibili.
     NON proporre prodotti specifici, NON chiedere se vuole aggiungere al carrello.
-16. Se nelle osservazioni trovi {{"clarify": true, "intent": "explain_capabilities"}}, spiega cosa
-    sai fare in modo conciso e amichevole, adatto a WhatsApp. Elenca le funzionalità principali:
+16. Se nelle osservazioni trovi {{"clarify": true, "intent": "explain_capabilities"}}:
+    {"Inizia con 'Ciao " + agent_nome + "!' poi presenta lo strumento in modo caldo e informale." if is_first_message and agent_nome else "Presenta lo strumento brevemente."}
+    Elenca le funzionalità in modo conciso, adatto a WhatsApp:
     - Cercare clienti per nome o ragione sociale
-    - Gestire il carrello: aggiungere, rimuovere, visualizzare e svuotare prodotti
-    - Consultare il catalogo: cercare prodotti, vedere brand e categorie disponibili
+    - Gestire il carrello: aggiungere, rimuovere, visualizzare, svuotare
+    - Consultare il catalogo: cercare prodotti, vedere brand e categorie
     - Confermare e inviare ordini
     - Consultare lo storico degli ordini
-    Concludi con un invito a chiedere ("Cosa vuoi fare?").
+    Concludi con un invito pratico (es. "Dimmi pure cosa ti serve!").
     Se trovi {{"clarify": true, "intent": "out_of_scope", "detail": "..."}}, rispondi con
     gentilezza che quella richiesta è fuori dal tuo ambito (menziona il `detail` se utile) e
     ricorda brevemente a cosa servi, invitando a chiedere qualcosa sul catalogo o sugli ordini.
