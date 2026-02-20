@@ -45,11 +45,17 @@ def get_model(role: Literal["planner", "generic"], structured_schema: Any = None
         )
     else:
         model_name = os.getenv(f"OPENAI_MODEL_{role.upper()}")
-        llm = ChatOpenAI(
-            model=model_name,
-            openai_api_key=os.getenv("OPENAI_API_KEY"),
-            temperature=0
-        )
+        _reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "")
+        _openai_kwargs = {
+            "model": model_name,
+            "openai_api_key": os.getenv("OPENAI_API_KEY"),
+        }
+        if _reasoning_effort:
+            _openai_kwargs["reasoning_effort"] = _reasoning_effort
+            # I modelli reasoning non supportano temperature
+        else:
+            _openai_kwargs["temperature"] = 0
+        llm = ChatOpenAI(**_openai_kwargs)
 
     if structured_schema:
         if method == "function_calling":
@@ -62,9 +68,10 @@ def get_model(role: Literal["planner", "generic"], structured_schema: Any = None
 # =============================================================================
 # SINCRONIZZAZIONE VALORI DISTINTI DI CATEGORIA E BRAND DA ANAGRAFICA PRODOTTO
 # =============================================================================
-facets = get_catalog_facets()
+facets = get_catalog_facets(facet_fields=["brand", "categoria", "sottocategoria"])
 brand_values = facets.get("brand", [])
 categoria_values = facets.get("categoria", [])
+sottocategoria_values = facets.get("sottocategoria", [])
 
 # =============================================================================
 # ANAGRAFICA AGENTI (caricata da data/agenti.csv)
@@ -98,6 +105,7 @@ from pydantic import BaseModel, Field
 class SearchClientArgs(BaseModel):
     placeholder: str                         # es. "PLACEHOLDER_CLIENT_1"
     query_text: Optional[str] = None         # testo originale da risolvere
+    city_filter: Optional[str] = None        # filtra per città (es. "Milano")
 
 class CartArgs(BaseModel):
     action: Literal["add", "remove", "view", "clear"]
@@ -113,6 +121,7 @@ class SearchProductArgs(BaseModel):
     filters_json: str = ""
     top_k: int = 10
     info_only: bool = False  # True per domande informative sul catalogo (non aggiunta al carrello)
+    client_id: Optional[str] = None  # se noto, restringe ai prodotti già ordinati da quel cliente
 
 class OrderArgs(BaseModel):
     action: Literal["insert_order", "list_orders"]
@@ -123,7 +132,8 @@ class OrderArgs(BaseModel):
 
 class CatalogArgs(BaseModel):
     action: Literal["list_brands", "list_categories", "list_brands_by_category"]
-    categoria: Optional[str] = None      # obbligatorio per list_brands_by_category
+    categoria: Optional[str] = None      # categoria (es. "Alcolici")
+    sottocategoria: Optional[str] = None # sottocategoria (es. "Birra", "Vino")
 
 class ClarifyArgs(BaseModel):
     intent: Literal["explain_capabilities", "out_of_scope"]
@@ -155,11 +165,16 @@ class WhatsAppListItem(BaseModel):
     title: str
     description: Optional[str]
 
+class WhatsAppSection(BaseModel):
+    title: str
+    items: List[WhatsAppListItem] = []
+
 class FinalResponse(BaseModel):
     text: str
     use_interactive_list: bool = False
     list_button_text: str = "Vedi opzioni"
-    items: List[WhatsAppListItem] = []
+    items: List[WhatsAppListItem] = []        # lista piatta (prodotti)
+    sections: List[WhatsAppSection] = []      # sezioni per città (clienti)
 
 class AgentState(BaseModel):
     agent_code: str
@@ -232,9 +247,11 @@ def send_order_email(order_result: dict, known_clients: dict, agent_code: str = 
 
     client_info = known_clients.get(client_id, {})
     client_name = client_info.get("ragione_sociale") or client_info.get("alias") or client_id
+    client_city = client_info.get("citta") or ""
 
     items_lines = "\n".join(
-        "  • {desc} x{qty} — €{tot:.2f}".format(
+        "  • [{sku}] {desc} x{qty} — €{tot:.2f}".format(
+            sku=r.get("sku", ""),
             desc=r.get("description") or r.get("sku", ""),
             qty=r.get("quantity", ""),
             tot=(r.get("price") or 0.0) * (r.get("quantity") or 0),
@@ -242,10 +259,14 @@ def send_order_email(order_result: dict, known_clients: dict, agent_code: str = 
         for r in items
     )
 
+    client_line = f"{client_name} ({client_id})"
+    if client_city:
+        client_line += f" — {client_city}"
+
     body = (
         f"Nuovo ordine confermato dal sistema Sales Bot.\n\n"
         f"Ordine: #{order_id}\n"
-        f"Cliente: {client_name} ({client_id})\n"
+        f"Cliente: {client_line}\n"
         f"Data: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
         f"Stato: RECEIVED\n\n"
         f"Prodotti:\n{items_lines if items_lines else '  (nessun dettaglio)'}\n\n"
@@ -258,14 +279,21 @@ def send_order_email(order_result: dict, known_clients: dict, agent_code: str = 
     msg["From"] = gmail_from
     msg["To"] = agent_to
 
+    print(f"📧 [EMAIL] Invio ordine #{order_id} a {agent_to} (agente {agent_code}) — {len(items)} prodotti, totale €{total:.2f}")
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
             smtp.login(gmail_from, gmail_password)
             smtp.sendmail(gmail_from, [agent_to], msg.as_string())
-        print(f"✅ Email ordine #{order_id} inviata a {agent_to} (agente {agent_code})")
+        print(f"✅ [EMAIL] Ordine #{order_id} inviata con successo a {agent_to}")
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"❌ [EMAIL] Autenticazione Gmail fallita (controlla GMAIL_APP_PASSWORD): {e}")
+        return False
+    except smtplib.SMTPException as e:
+        print(f"❌ [EMAIL] Errore SMTP invio ordine #{order_id}: {e}")
+        return False
     except Exception as e:
-        print(f"❌ Errore invio email: {e}")
+        print(f"❌ [EMAIL] Errore generico invio ordine #{order_id}: {e}")
         return False
 
 
@@ -508,6 +536,7 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 2. **Clienti già noti**: Se il cliente menzionato corrisponde (nome, alias, ragione sociale, città) a un entry in "Lista clienti già risolti", usa quel client_id DIRETTAMENTE. NON creare search_client.
 
 3. **Prodotti già noti**: Se il prodotto menzionato corrisponde a un entry in "Lista prodotti già risolti", usa quello sku DIRETTAMENTE. NON creare search_product.
+   ⚠️ Usa uno SKU da "Lista prodotti già risolti" SOLO se il nome prodotto o brand nella lista corrisponde ESATTAMENTE a ciò che l'utente ha richiesto. Esempio: se l'utente chiede "Beck's" e in lista c'è solo "Santàl", NON usare lo SKU di Santàl — crea search_product per Beck's.
 
 4. **Operazione incompleta**: Se dalla chat history risulta un'operazione in corso rimasta in attesa (cliente o prodotto mancante), e il messaggio attuale fornisce l'informazione mancante, ricostruisci l'operazione completa con manage_cart usando i dati ora disponibili.
 
@@ -525,17 +554,32 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 - Genera un piano strutturato in task, dove ogni task ha: ID univoco, tool specifico, args corretti, deps verso task da completare prima, status iniziale "pending".
 ----------------------------------------------------------------------
 
-1️⃣ **search_client** — args: SearchClientArgs(placeholder, query_text)
+1️⃣ **search_client** — args: SearchClientArgs(placeholder, query_text, city_filter)
 - Cerca il client_id di un cliente non ancora noto nel database.
 - NON usare se il client_id è già in "Lista clienti già risolti".
+- **query_text**: nome, alias o ragione sociale del cliente (lascia None se non specificato).
+- **city_filter**: se l'utente chiede esplicitamente i clienti di una città (es. "clienti di Milano",
+  "lista Como", "dammi i clienti di Varese"), passa il nome della città con la maiuscola iniziale
+  (es. "Milano", "Como", "Varese", "Binasco") e lascia query_text=None.
+  Se l'utente cerca un cliente specifico per nome O per città, usa il campo appropriato.
+- ⚠️ "mostra i miei clienti" / "lista clienti" / "chi sono i miei clienti" → search_client con
+  query_text=None (lista generica). NON usare manage_cart view per elencare clienti. MAI.
 
-2️⃣ **search_product** — args: SearchProductArgs(placeholder, query, filters_json, top_k, info_only)
+2️⃣ **search_product** — args: SearchProductArgs(placeholder, query, filters_json, top_k, info_only, client_id)
 
   **Modalità RISOLUZIONE SKU** (info_only=False, default):
   - Cerca lo sku di un prodotto non ancora noto per poi aggiungerlo al carrello.
   - NON usare se lo sku è già in "Lista prodotti già risolti".
-  - NON dipende mai da search_client — cliente e prodotto si cercano sempre in parallelo.
   - top_k: 10 per ricerche puntuali.
+  - **client_id** (opzionale): quando stai aggiungendo prodotti al carrello di un cliente specifico,
+    passa il client_id in SearchProductArgs. Il sistema userà lo storico ordini del cliente per
+    restringere i risultati ai prodotti già ordinati in passato (se esistono ordini). Se la ricerca
+    ristretta non produce risultati, il sistema usa automaticamente il catalogo completo.
+    - Cliente già noto (in "Lista clienti già risolti"): passa l'ID direttamente e mantieni la
+      ricerca IN PARALLELO (nessuna dipendenza da search_client).
+    - Cliente NON ancora noto: aggiungi deps=[id_task_search_client] e usa il placeholder del
+      cliente come client_id. Il placeholder verrà risolto prima dell'esecuzione.
+  - Se info_only=True: NON includere client_id.
 
   **Modalità INFO CATALOGO** (info_only=True):
   - Usa quando l'utente chiede informazioni sui prodotti senza volerli ordinare:
@@ -544,6 +588,10 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
   - Questo task è STANDALONE: NON creare task manage_cart collegati.
     Il responder mostrerà direttamente i risultati all'utente.
   - placeholder: usa una stringa descrittiva es. "INFO_HEINEKEN", "INFO_BIRRE", "INFO_BRAND".
+  - **query** (OBBLIGATORIO — non lasciare mai vuota): imposta SEMPRE il nome del brand,
+    prodotto o categoria cercato dall'utente. È il driver principale della ricerca vettoriale.
+    Esempi: "avete la Leffe?" → query="Leffe" | "prodotti Heineken" → query="Heineken"
+    | "le birre del catalogo" → query="birre" | "acque minerali" → query="acque minerali".
   - top_k: scegli in base all'ampiezza della richiesta:
       • 10  — prodotto specifico ("avete la Peroni 33cl?")
       • 20  — tutti i prodotti di un brand ("prodotti Heineken")
@@ -551,20 +599,20 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
       • 100 — query molto ampie ("tutto il catalogo alcolici", "mostrami tutto")
     Nota: top_k è un massimo — se il catalogo contiene meno prodotti corrispondenti,
     ne vengono restituiti semplicemente meno.
-  - Per domande su brand disponibili o categorie disponibili, usa stringa vuota come query
-    e imposta il filtro appropriato.
 
   **Filtri disponibili** (filters_json = stringa JSON, stringa vuota = nessun filtro):
-  - Per brand:     {{"brand": "Heineken"}}
-  - Per categoria: {{"categoria": "Alcolici"}}
-  - Combinati:     {{"brand": "Heineken", "categoria": "Alcolici"}}
+  - Per brand:          {{"brand": "Heineken"}}
+  - Per categoria:      {{"categoria": "Alcolici"}}
+  - Per sottocategoria: {{"sottocategoria": "Birra"}}
+  - Combinati:          {{"brand": "Heineken", "sottocategoria": "Birra"}}
   - ⚠️ Usa ESATTAMENTE i valori dalle liste seguenti (rispetta maiuscole, apostrofi, spazi):
-
-  Brand ammessi:
-  {json.dumps(brand_values, ensure_ascii=False)}
-
-  Categorie ammesse:
-  {json.dumps(categoria_values, ensure_ascii=False)}
+  Brand ammessi:          {json.dumps(brand_values, ensure_ascii=False)}
+  Categorie ammesse:      {json.dumps(categoria_values, ensure_ascii=False)}
+  Sottocategorie ammesse: {json.dumps(sottocategoria_values, ensure_ascii=False)}
+  - Preferisci `sottocategoria` a `categoria` quando l'utente chiede un tipo specifico
+    (es. "birre" → sottocategoria="Birra", "vini" → sottocategoria="Vino",
+     "vodka" → sottocategoria="Vodka"). Usa `categoria` solo per macro-raggruppamenti
+    (es. "alcolici", "analcolici").
 
 3️⃣ **manage_cart** — args: CartArgs(action, client_id, sku, quantity)
 - action: "add" | "remove" | "view" | "clear"
@@ -579,6 +627,8 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
   o in "Lista clienti già risolti". Se NON è determinabile, DEVI creare un task search_client
   con query_text vuoto (elenca tutti i clienti dell'agente) e fare in modo che manage_cart
   dipenda da esso. NON usare placeholder inventati senza un search_client corrispondente.
+  ⚠️ "mostra carrello" / "vedi carrello": se il client_id è già noto, pianifica SOLO manage_cart view.
+  NON aggiungere search_client in parallelo — causerebbe la visualizzazione della lista clienti.
 - deps: includi search_client se client_id mancante; includi search_product se sku mancante.
   Se entrambi già noti → deps vuoti.
 
@@ -587,10 +637,15 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 - **insert_order**: conferma e invia l'ordine. Legge il carrello del cliente, crea l'ordine nel
   DB con un ID progressivo automatico (order_id), svuota il carrello.
   ⚠️ PIANIFICA insert_order SOLO se il messaggio dell'utente è una conferma esplicita dell'ordine:
-  parole come "sì", "confermo", "invia", "procedi", "ok manda", "vai". NON pianificare
-  insert_order quando l'utente sta fornendo una quantità, un nome di prodotto o un nome di
-  cliente — in quei casi l'utente sta completando l'ordine, non confermandolo.
-  NON combinare mai add (manage_cart) e insert_order nello stesso piano.
+  parole come "sì", "confermo", "invia", "procedi", "ok manda", "vai".
+  NON pianificare insert_order quando l'utente sta fornendo una quantità, un nome di prodotto
+  o un nome di cliente — in quei casi l'utente sta completando l'ordine, non confermandolo.
+  ❌ NON combinare mai add (manage_cart) e insert_order nello stesso piano. MAI.
+  Esempio SBAGLIATO: "nuovo ordine per Mario, aggiungi Santàl 100pz" → NON pianificare insert_order.
+  Esempio CORRETTO: stesso messaggio → pianifica solo clear + add. Aspetta conferma esplicita.
+  ⚠️ CASO CONFERMA ("sì" / "confermo" / "invia"): il carrello è già popolato dal turno precedente.
+  Pianifica SOLO insert_order con il client_id già noto. NON aggiungere manage_cart add —
+  le quantità sono già in carrello e verrebbero raddoppiate inutilmente.
   Richiede client_id reale. Se non determinabile, crea search_client con deps.
 - **list_orders**: elenca gli ordini dell'agente. Filtri opzionali:
   - client_id: per vedere ordini di un cliente specifico
@@ -606,8 +661,13 @@ Prima di pianificare qualsiasi task, controlla sempre nell'ordine:
 - action: "list_brands" | "list_categories" | "list_brands_by_category"
 - **list_brands**: restituisce tutti i brand del catalogo. Nessun parametro aggiuntivo. Deps: vuoti.
 - **list_categories**: restituisce tutte le categorie. Nessun parametro aggiuntivo. Deps: vuoti.
-- **list_brands_by_category**: restituisce i brand che hanno prodotti nella categoria indicata.
-  Richiede `categoria` (valore esatto da categoria_values). Deps: vuoti.
+- **list_brands_by_category**: restituisce i brand che hanno prodotti nella categoria o sottocategoria indicata.
+  - Usa `categoria` per filtrare per categoria principale (es. "Alcolici", "Succhi").
+  - Usa `sottocategoria` per filtrare per tipo più specifico (es. "Birra", "Vino", "Vodka").
+  - ⚠️ "birre", "birra" → sottocategoria="Birra" (NON categoria="Birre", che non esiste).
+  - ⚠️ NON inventare valori: usa SOLO i valori esatti dalle liste sottostanti.
+  Categorie valide:   {json.dumps(categoria_values, ensure_ascii=False)}
+  Sottocategorie valide: {json.dumps(sottocategoria_values, ensure_ascii=False)}
 - Non ha dipendenze da altri task.
 
 6️⃣ **clarify** — args: ClarifyArgs(intent, detail)
@@ -668,6 +728,7 @@ client_id e sku sono già noti prima di pianificare ricerche.
         plan_adapter = TypeAdapter(Plan)
         plan = plan_adapter.validate_python(plan_raw)
 
+        print(f"\n💬 [DOMANDA UTENTE]: {state.question}")
         print(f"DEBUG PLANNER: tasks_count={len(plan.tasks)}")
         for t in plan.tasks:
             args_repr = {k: v for k, v in t.args.__dict__.items() if v is not None and v != "" and v != []}
@@ -708,6 +769,51 @@ def executor_node(state: AgentState):
     for t in tasks:
         print(f"   └─ Task: id={t.id} tool={t.tool}")
 
+    # ── GUARDRAIL: blocca insert_order se nello stesso piano c'è un add ──────
+    _has_cart_add = any(
+        t.tool == "manage_cart" and getattr(t.args, "action", "") == "add"
+        for t in tasks
+    )
+    _has_insert_order = any(
+        t.tool == "manage_orders" and getattr(t.args, "action", "") == "insert_order"
+        for t in tasks
+    )
+    if _has_cart_add and _has_insert_order:
+        print(" 🚫 GUARDRAIL: insert_order bloccato — stesso piano contiene un 'add'. Rimuovo insert_order.")
+        tasks = [t for t in tasks if not (
+            t.tool == "manage_orders" and getattr(t.args, "action", "") == "insert_order"
+        )]
+        obs["_guardrail_insert_order_blocked"] = {
+            "blocked": True,
+            "reason": "Piano invalido: add + insert_order insieme. L'ordine NON è stato creato."
+        }
+
+    # ── GUARDRAIL: piano assurdo — tutti manage_cart view su clienti diversi ─
+    _view_tasks = [
+        t for t in tasks
+        if t.tool == "manage_cart" and getattr(t.args, "action", "") == "view"
+    ]
+    _view_client_ids = {getattr(t.args, "client_id", None) for t in _view_tasks}
+    if len(_view_tasks) >= 3 and len(_view_client_ids) == len(_view_tasks):
+        # Tutti view su clienti distinti: il planner ha confuso "mostra clienti" con "mostra carrello"
+        print(f" 🚫 GUARDRAIL: piano con {len(_view_tasks)} manage_cart view su clienti diversi — probabile misinterpretazione. Sostituisco con search_client.")
+        _fake_obs_key = "__guardrail_client_list__"
+        tasks = []   # svuota il piano: il responder gestirà con obs fake
+        obs = dict(getattr(state, "observations", {}))
+        obs.setdefault("placeholder_map", {})
+        # Inietta una nota nell'observation per guidare il responder
+        obs[_fake_obs_key] = {
+            "error": "piano_sostituito",
+            "message": "Il planner ha generato un piano non valido per 'mostra clienti'. Usa search_client.",
+        }
+        return {
+            "observations": obs,
+            "next_tasks": [],
+            "known_clients": dict(getattr(state, "known_clients", {})),
+            "known_products": dict(getattr(state, "known_products", {})),
+        }
+    # ─────────────────────────────────────────────────────────────────────────
+
     obs = dict(getattr(state, "observations", {}))
     obs.setdefault("placeholder_map", {})
     placeholder_map = obs["placeholder_map"]
@@ -725,22 +831,51 @@ def executor_node(state: AgentState):
         and not str(getattr(t.args, "client_id", "")).startswith("ph_")
         and getattr(t.args, "client_id", None) not in updated_known_clients
     }
+    _hallucinated_client_ids: set = set()
     if _missing_client_ids:
         try:
             _db = _get_db_path()
             _conn = sqlite3.connect(_db)
             _conn.row_factory = sqlite3.Row
+            _question_lower = (state.question or "").lower()
             for _cid in _missing_client_ids:
                 _row = _conn.execute(
-                    "SELECT client_id, ragione_sociale, alias, citta FROM clienti_fts WHERE client_id=?",
+                    "SELECT client_id, ragione_sociale, alias, citta, agent_id FROM clienti_fts WHERE client_id=?",
                     (_cid,)
                 ).fetchone()
                 if _row:
-                    updated_known_clients[_cid] = dict(_row)
-                    print(f"   🔍 Client lookup: {_cid} → {_row['ragione_sociale']}")
+                    # Verifica: il nome del cliente appare nella domanda o client appartiene all'agente?
+                    _alias = (_row["alias"] or "").lower()
+                    _rs = (_row["ragione_sociale"] or "").lower()
+                    _agent_match = _row["agent_id"] == agent_code
+                    _name_in_q = any(
+                        w in _question_lower
+                        for w in (_alias.split() + _rs.split())
+                        if len(w) >= 3
+                    )
+                    if _agent_match and (_name_in_q or len(_missing_client_ids) == 1):
+                        updated_known_clients[_cid] = dict(_row)
+                        print(f"   🔍 Client lookup: {_cid} → {_row['ragione_sociale']}")
+                    else:
+                        # Client_id non citato nella domanda → probabile allucinazione del planner
+                        _hallucinated_client_ids.add(_cid)
+                        print(f"   🚫 Client hallucination rilevata: {_cid} ({_row['ragione_sociale']}) non menzionato nella domanda")
             _conn.close()
         except Exception as _e:
             print(f"   ⚠️ Client lookup error: {_e}")
+
+    # Rimuovi task che usano client allucinati e aggiungi osservazione di errore
+    if _hallucinated_client_ids:
+        _bad_task_ids = {
+            t.id for t in tasks
+            if getattr(t.args, "client_id", None) in _hallucinated_client_ids
+        }
+        tasks = [t for t in tasks if t.id not in _bad_task_ids]
+        for _bad_id in _hallucinated_client_ids:
+            obs[f"__hallucinated_{_bad_id}__"] = {
+                "error": "client_hallucinated",
+                "message": f"Il planner ha usato {_bad_id} ma questo cliente non è stato menzionato dall'utente. Chiedi al cliente di specificare il cliente corretto.",
+            }
 
     updated_tasks = tasks.copy()
 
@@ -786,7 +921,11 @@ def executor_node(state: AgentState):
                 # SEARCH CLIENT
                 # -----------------------------------------------------------------
                 if task.tool == "search_client":
-                    res = search_client_smart(agent_code=agent_code, query_text=task.args.query_text)
+                    res = search_client_smart(
+                        agent_code=agent_code,
+                        query_text=task.args.query_text,
+                        city_filter=getattr(task.args, "city_filter", None),
+                    )
 
                     if not res:
                         task.status = "failed"
@@ -803,6 +942,9 @@ def executor_node(state: AgentState):
                                     "citta": r.get("citta"),
                                 }
 
+                        _is_generic_list = not task.args.query_text and not getattr(task.args, "city_filter", None)
+                        _is_city_list = not task.args.query_text and getattr(task.args, "city_filter", None)
+
                         if len(res) == 1 and getattr(task.args, "placeholder", None):
                             # Risolto univocamente
                             resolved_id = res[0].get("client_id")
@@ -811,8 +953,14 @@ def executor_node(state: AgentState):
                             _replace_placeholders_in_all_tasks()
                             task.status = "success"
                             obs[task.id] = {"results": res}
+                        elif _is_generic_list or _is_city_list:
+                            # Lista generica o per città — mostra tutti senza chiedere selezione
+                            obs[task.id] = {"results": res, "list_display": True}
+                            task.status = "success"
+                            label = f"città={task.args.city_filter}" if _is_city_list else "tutti i clienti"
+                            print(f" 📋 Lista clienti ({label}): {len(res)} risultati")
                         else:
-                            # Più risultati — serve scelta utente
+                            # Ricerca specifica con più risultati — serve scelta utente
                             obs[task.id] = {"results": res, "pending_selection": True}
                             task.status = "pending"
                             print(f" ⚠️ Disambiguazione necessaria per '{task.args.query_text}' ({len(res)} risultati)")
@@ -821,24 +969,74 @@ def executor_node(state: AgentState):
                 # SEARCH PRODUCT
                 # -----------------------------------------------------------------
                 elif task.tool == "search_product":
-                    # Se query è vuota ma c'è un filtro brand/categoria, usa il valore
-                    # del filtro come query per evitare il fallback generico "bevande"
+                    # Deriva search_query con priorità decrescente:
+                    # 1. query esplicita del planner
+                    # 2. valore brand/categoria da filters_json
+                    # 3. testo del placeholder (es. INFO_LEFFE → "leffe")
                     search_query = task.args.query
                     if not search_query and task.args.filters_json:
                         try:
                             filter_dict = json.loads(task.args.filters_json)
-                            search_query = filter_dict.get("brand") or filter_dict.get("categoria") or ""
+                            search_query = (
+                                filter_dict.get("brand")
+                                or filter_dict.get("sottocategoria")
+                                or filter_dict.get("categoria")
+                                or ""
+                            )
                         except Exception:
                             pass
+                    if not search_query:
+                        import re as _re
+                        _ph = getattr(task.args, "placeholder", "") or ""
+                        _derived = _re.sub(r'^(?:INFO_|ph_prodotto_|ph_brand_|BRAND_)', '', _ph, flags=_re.IGNORECASE)
+                        _derived = _derived.replace('_', ' ').strip().lower()
+                        if _derived:
+                            search_query = _derived
+                            print(f" ⚠️ Query derivata dal placeholder: '{search_query}'")
+
+                    # Storico ordini: se client_id è noto, recupera SKU già ordinati
+                    _client_id_hist = getattr(task.args, "client_id", None)
+                    _sku_whitelist: list = []
+                    if _client_id_hist and not str(_client_id_hist).startswith("ph_"):
+                        try:
+                            _hist_conn = sqlite3.connect(_get_db_path())
+                            _hist_rows = _hist_conn.execute(
+                                """SELECT DISTINCT oi.sku
+                                   FROM order_item oi
+                                   JOIN [order] o ON oi.order_id = o.order_id
+                                   WHERE o.client_id = ? AND o.agent_id = ?""",
+                                (_client_id_hist, agent_code),
+                            ).fetchall()
+                            _hist_conn.close()
+                            _sku_whitelist = [r[0] for r in _hist_rows if r[0]]
+                            if _sku_whitelist:
+                                print(f" 🕰️ Storico ordini {_client_id_hist}: {len(_sku_whitelist)} SKU noti → ricerca ristretta")
+                            else:
+                                print(f" ℹ️ Nessuno storico per {_client_id_hist} → ricerca nel catalogo completo")
+                        except Exception as _he:
+                            print(f" ⚠️ Errore query storico ordini: {_he}")
 
                     raw = search_product_smart.invoke({
                         "query": search_query,
                         "planner_motivation": "",
                         "filters_json": task.args.filters_json,
                         "top_k": task.args.top_k,
+                        "sku_whitelist": _sku_whitelist or None,
                     })
                     # Il tool restituisce {"results": [...], "metadata": {...}}
                     results = raw.get("results", []) if isinstance(raw, dict) else []
+
+                    # Fallback: se la whitelist non ha prodotti corrispondenti alla query,
+                    # ripeti la ricerca nel catalogo completo
+                    if not results and _sku_whitelist:
+                        print(f" 🔄 Nessun match nello storico ordini → ricerca nel catalogo completo")
+                        raw = search_product_smart.invoke({
+                            "query": search_query,
+                            "planner_motivation": "",
+                            "filters_json": task.args.filters_json,
+                            "top_k": task.args.top_k,
+                        })
+                        results = raw.get("results", []) if isinstance(raw, dict) else []
 
                     # Log risultati RAG
                     if results:
@@ -948,12 +1146,16 @@ def executor_node(state: AgentState):
                                 if task.args.price is None:
                                     task.args.price = product_info.get("prezzo")
                                 if task.args.description is None:
-                                    brand = product_info.get("brand") or ""
+                                    descrizione = product_info.get("descrizione") or ""
                                     formato = product_info.get("formato") or ""
-                                    task.args.description = (
-                                        f"{brand} {formato}".strip()
-                                        or product_info.get("descrizione")
-                                    )
+                                    # Usa la descrizione completa (es. "Santàl Arancia 100%") + formato
+                                    if descrizione and formato and formato not in descrizione:
+                                        task.args.description = f"{descrizione} {formato}".strip()
+                                    elif descrizione:
+                                        task.args.description = descrizione
+                                    else:
+                                        brand = product_info.get("brand") or ""
+                                        task.args.description = f"{brand} {formato}".strip()
 
                         res = sql_manage_cart(agent_code=agent_code, args=task.args)
                         obs[task.id] = res
@@ -983,12 +1185,40 @@ def executor_node(state: AgentState):
 
                     elif action == "list_brands_by_category":
                         cat = getattr(task.args, "categoria", None)
-                        if not cat:
-                            obs[task.id] = {"error": "categoria obbligatoria per list_brands_by_category"}
+                        subcat = getattr(task.args, "sottocategoria", None)
+                        if not cat and not subcat:
+                            obs[task.id] = {"error": "categoria o sottocategoria obbligatoria per list_brands_by_category"}
                             task.status = "failed"
                         else:
-                            escaped_cat = cat.replace("'", "''")
-                            odata = f"categoria eq '{escaped_cat}'"
+                            # Auto-remap: se categoria non è valida, controlla se corrisponde a una sottocategoria
+                            filter_label = cat or subcat
+                            if cat and cat not in categoria_values:
+                                # cerca in sottocategorie: prima esatto, poi prefisso 4+ car (gestisce plurali)
+                                _cat_lower = cat.lower()
+                                _sc_match = next(
+                                    (s for s in sottocategoria_values if s.lower() == _cat_lower), None
+                                ) or next(
+                                    (s for s in sottocategoria_values
+                                     if len(_cat_lower) >= 4 and (
+                                         s.lower().startswith(_cat_lower[:4]) or
+                                         _cat_lower.startswith(s.lower()[:4])
+                                     )), None
+                                )
+                                if _sc_match:
+                                    print(f" ⚠️ Categoria '{cat}' non valida → rimappata a sottocategoria '{_sc_match}'")
+                                    subcat = _sc_match
+                                    cat = None
+                                else:
+                                    print(f" ⚠️ Categoria '{cat}' non trovata in categorie né sottocategorie")
+
+                            if subcat:
+                                escaped_sc = subcat.replace("'", "''")
+                                odata = f"sottocategoria eq '{escaped_sc}'"
+                                filter_label = subcat
+                            else:
+                                escaped_cat = (cat or "").replace("'", "''")
+                                odata = f"categoria eq '{escaped_cat}'"
+
                             facet_result = get_catalog_facets(
                                 facet_fields=["brand"],
                                 odata_filter=odata
@@ -996,11 +1226,11 @@ def executor_node(state: AgentState):
                             brands_in_cat = facet_result.get("brand", [])
                             obs[task.id] = {
                                 "brands": brands_in_cat,
-                                "categoria": cat,
+                                "categoria": filter_label,
                                 "catalog_info": True
                             }
                             task.status = "success"
-                            print(f"   ✅ {len(brands_in_cat)} brand nella categoria '{cat}'")
+                            print(f"   ✅ {len(brands_in_cat)} brand nella categoria '{filter_label}'")
                     else:
                         obs[task.id] = {"error": f"Azione catalog non riconosciuta: {action}"}
                         task.status = "failed"
@@ -1092,9 +1322,14 @@ def responder_node(state: AgentState):
         (v for v in obs.values() if isinstance(v, dict) and "order_id" in v),
         None
     )
+    # Rilevamento guardrail insert_order bloccato
+    insert_order_blocked = obs.get("_guardrail_insert_order_blocked", {}).get("blocked", False)
 
-    # Risolvi nome cliente dal primo task manage_cart (usa sempre ragione_sociale)
+    # Risolvi nome cliente:
+    # 1. Prima prova da cart_tasks (disponibili solo al primo turno)
+    # 2. Se vuoti (executor li ha azzerati), estrai client_id dalle observation strings
     cart_client_name = None
+    _cart_client_id_from_obs = None
     for t in cart_tasks:
         cid = getattr(t.args, "client_id", None)
         if cid and cid in known_clients:
@@ -1104,6 +1339,20 @@ def responder_node(state: AgentState):
         elif cid:
             cart_client_name = cid
             break
+
+    if not cart_client_name and is_cart_mutated:
+        # Estrai client_id da stringhe come "Aggiunto Nx SKU X al carrello per cliente C001."
+        import re as _re_c
+        for _v in obs.values():
+            _m = _re_c.search(r'per cliente (C\d+)', str(_v))
+            if _m:
+                _cart_client_id_from_obs = _m.group(1)
+                if _cart_client_id_from_obs in known_clients:
+                    _info = known_clients[_cart_client_id_from_obs]
+                    cart_client_name = _info.get("ragione_sociale") or _info.get("alias") or _cart_client_id_from_obs
+                else:
+                    cart_client_name = _cart_client_id_from_obs
+                break
 
     # Verifica presenza liste (clienti/prodotti multipli da disambiguare)
     found_lists = [
@@ -1139,10 +1388,15 @@ def responder_node(state: AgentState):
         multi_disambiguation_text = "\n\n".join(blocks)
 
     # Se operazione riuscita, recupera carrello aggiornato per mostrarlo
+    # (sia dopo mutazioni che dopo view diretta)
     cart_after_mutation = None
-    if is_cart_mutated and cart_tasks:
+    _cart_cid_for_view = (
+        getattr(cart_tasks[0].args, "client_id", None) if cart_tasks
+        else _cart_client_id_from_obs
+    )
+    if (is_cart_mutated or is_cart_view) and _cart_cid_for_view:
         try:
-            cid = getattr(cart_tasks[0].args, "client_id", None)
+            cid = _cart_cid_for_view  # può venire da cart_tasks o da obs
             agent_code_val = getattr(state, "agent_code", "AG001")
             if cid:
                 view_args = CartArgs(action="view", client_id=cid)
@@ -1171,28 +1425,56 @@ def responder_node(state: AgentState):
 
     # Regole dinamiche carrello
     cart_rules = ""
-    if is_cart_view and cart_client_name:
-        cart_rules += f"\n18. Inizia la risposta sul carrello con 'Carrello di {cart_client_name}:' prima di elencare i prodotti."
-    if is_cart_mutated:
-        nome = f"di {cart_client_name}" if cart_client_name else ""
-        if cart_after_mutation:
-            cart_summary = "\n".join(
-                "• {desc} x{qty}{total}".format(
-                    desc=r["descrizione"],
-                    qty=r["quantità"],
-                    total=(
-                        f" — €{r['prezzo_unitario'] * r['quantità']:.2f}"
-                        if r.get("prezzo_unitario") and r.get("quantità")
-                        else ""
-                    ),
-                )
-                for r in cart_after_mutation
+    nome = f"di {cart_client_name}" if cart_client_name else ""
+
+    def _build_cart_summary(items):
+        total_val = sum(
+            (r.get("prezzo_unitario") or 0) * (r.get("quantità") or 0)
+            for r in items
+        )
+        lines = "\n".join(
+            "• {desc} x{qty}{subtot}".format(
+                desc=r["descrizione"],
+                qty=r["quantità"],
+                subtot=(
+                    f" — €{r['prezzo_unitario'] * r['quantità']:.2f}"
+                    if r.get("prezzo_unitario") and r.get("quantità")
+                    else ""
+                ),
             )
+            for r in items
+        )
+        return lines, total_val
+
+    if is_cart_view and cart_client_name:
+        if cart_after_mutation and n_pending == 0:
+            summary_lines, total_val = _build_cart_summary(cart_after_mutation)
+            total_str = f"\nTotale carrello: €{total_val:.2f}" if total_val else ""
+            cart_rules += (
+                f"\n18. Rispondi SOLO con il seguente riepilogo carrello {nome} "
+                f"(già formattato, copialo senza modifiche — non aggiungere altro):\n"
+                f"Carrello di {cart_client_name}:\n"
+                f"{summary_lines}{total_str}\n"
+                f"Poi chiedi: 'Vuoi confermare e inviare l'ordine?'"
+            )
+        elif cart_after_mutation is not None and len(cart_after_mutation) == 0:
+            cart_rules += f"\n18. Il carrello {nome} è vuoto. Comunicalo chiaramente."
+    if is_cart_mutated:
+        if cart_after_mutation and n_pending == 0:
+            # Mostra riepilogo carrello solo se NON ci sono prodotti/clienti ancora da disambiguare
+            summary_lines, total_val = _build_cart_summary(cart_after_mutation)
+            total_str = f"\nTotale: €{total_val:.2f}" if total_val else ""
             cart_rules += (
                 f"\n19. Dopo aver confermato l'operazione, riporta il seguente riepilogo carrello {nome} "
                 f"(già formattato, copialo senza modifiche):\n"
-                f"{cart_summary}\n"
+                f"{summary_lines}{total_str}\n"
                 f"Poi chiedi: 'Vuoi confermare e inviare l'ordine?'"
+            )
+        elif n_pending > 0:
+            cart_rules += (
+                f"\n19. Ci sono ancora prodotti/clienti da disambiguare (pending_selection). "
+                f"NON mostrare riepilogo ordine né chiedere conferma ordine. "
+                f"Chiedi prima di scegliere tra le opzioni in lista."
             )
         else:
             cart_rules += f"\n19. Dopo aver confermato l'operazione, chiedi: 'Vuoi confermare e inviare l'ordine?'"
@@ -1230,7 +1512,14 @@ dati. Usa la mappa clienti sopra per tradurre client_id in nome leggibile.
 2. SOLO SE 'Prodotti/clienti aggiunti al DB' è NO e nelle osservazioni c'è {{"error": "client_required"}}:
    chiedi "Per quale cliente vuoi ordinare?"
 3. Se c'è ESATTAMENTE UN risultato con 'pending_selection: true' (clienti o prodotti),
-   usa use_interactive_list=True per elencare le opzioni.
+   usa use_interactive_list=True con `items` per elencare le opzioni.
+   - Per PRODOTTI: id=SKU, title=nome breve prodotto (max 24 car), description=brand + formato + prezzo.
+   - Per CLIENTI: id=client_id, title=alias (max 24 car), description=ragione sociale abbreviata.
+     (Il raggruppamento per città viene applicato automaticamente dal sistema.)
+3b. Se c'è un risultato con 'list_display: true' (lista generica clienti richiesta dall'utente),
+    mostra i clienti in lista interattiva (il sistema raggruppa per città automaticamente).
+    NON chiedere "quale cliente vuoi selezionare?" — l'utente ha chiesto di vedere la lista,
+    non di disambiguare. Scrivi solo un breve intro come "Ecco i tuoi clienti:".
 4. Se ci sono DUE O PIÙ risultati con 'pending_selection: true', NON usare la lista
    interattiva. Manda invece un messaggio di testo con tutte le opzioni già formattate:
 ---
@@ -1277,6 +1566,7 @@ dati. Usa la mappa clienti sopra per tradurre client_id in nome leggibile.
 17. {"ORDINE CONFERMATO — usa solo queste informazioni per rispondere:" if confirmed_order else ""}
     {f"Ordine #{confirmed_order['order_id']} confermato per {confirmed_order.get('client_id', '')}. Totale: €{confirmed_order.get('total', 0):.2f} ({confirmed_order.get('items_count', 0)} prodotti). Rispondi con un messaggio di conferma chiaro, includi il numero ordine." if confirmed_order else ""}
     {"NON chiedere di nuovo se vuole confermare — l'ordine è già stato creato." if confirmed_order else ""}{cart_rules if not confirmed_order else ""}
+{"⚠️ ATTENZIONE — PIANO INVALIDO: il sistema ha rilevato un errore nel piano (add + insert_order nello stesso turno). L'ordine NON è stato creato e NON è stato inviato. NON dire 'Ordine inviato'. Mostra il riepilogo del carrello e chiedi di nuovo: 'Vuoi confermare e inviare l'ordine?'" if insert_order_blocked else ""}
 """
 
     # 5️⃣ Invocazione modello
@@ -1286,7 +1576,52 @@ dati. Usa la mappa clienti sopra per tradurre client_id in nome leggibile.
         + [HumanMessage(content=state.question or "")]
     )
 
-    # 6️⃣ Debug log interno
+    # 6️⃣ Post-processing: raggruppa clienti per città se pending_selection
+    # Applica indipendentemente da use_interactive_list (l'LLM con molti risultati può generare testo piatto)
+    # NON applicare se ci sono risultati di carrello nelle observations (es. "mostra carrello" + search_client)
+    _has_cart_obs = any(
+        isinstance(v, list) and v and isinstance(v[0], dict) and "sku" in v[0]
+        for v in state.observations.values()
+    ) or is_cart_view or is_cart_mutated
+    if not res.sections and not _has_cart_obs:
+        _client_results = None
+        for _obs_data in state.observations.values():
+            if isinstance(_obs_data, dict) and (
+                _obs_data.get("pending_selection") or _obs_data.get("list_display")
+            ):
+                _results = _obs_data.get("results", [])
+                if _results and "client_id" in _results[0]:
+                    _client_results = _results
+                    break
+
+        if _client_results:
+            _grouped: dict = {}
+            for _r in _client_results:
+                _city = _r.get("citta") or "Altro"
+                if _city not in _grouped:
+                    _grouped[_city] = []
+                if len(_grouped[_city]) < 10:   # max 10 per sezione
+                    _grouped[_city].append(_r)
+
+            _sections = []
+            for _city in sorted(_grouped.keys()):
+                _items = [
+                    WhatsAppListItem(
+                        id=_r["client_id"],
+                        title=(_r.get("alias") or _r.get("ragione_sociale", "?"))[:24],
+                        description=(_r.get("ragione_sociale", "") or "")[:72],
+                    )
+                    for _r in _grouped[_city]
+                ]
+                if _items:
+                    _sections.append(WhatsAppSection(title=_city, items=_items))
+
+            if _sections:
+                res.sections = _sections[:10]   # max 10 sezioni
+                res.items = []                   # sezioni hanno precedenza
+                res.use_interactive_list = True  # forza lista interattiva
+
+    # 7️⃣ Debug log interno
     print("\n" + "📱" + "=" * 50)
     print(f"VERIFICA INTERNA:")
     print(f" - Was Added? {was_added}")
@@ -1294,7 +1629,11 @@ dati. Usa la mappa clienti sopra per tradurre client_id in nome leggibile.
     print(f"WHATSAPP OUT: {res.text}")
 
     if res.use_interactive_list:
-        print(f"LISTA ATTIVA: {len(res.items)} elementi inviati.")
+        if res.sections:
+            total = sum(len(s.items) for s in res.sections)
+            print(f"LISTA ATTIVA: {len(res.sections)} sezioni / {total} clienti totali.")
+        else:
+            print(f"LISTA ATTIVA: {len(res.items)} elementi inviati.")
 
     print("=" * 50 + "\n")
 

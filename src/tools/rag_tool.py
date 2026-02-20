@@ -114,24 +114,35 @@ def _azure_search_retrieve(query: str, top_k: int, odata_filter: Optional[str]) 
 # ---------------------------------------------------------
 @tool
 def search_product_smart(
-    query: str, 
-    planner_motivation: str, 
-    filters_json: str = "", 
-    top_k: int = 10
+    query: str,
+    planner_motivation: str,
+    filters_json: str = "",
+    top_k: int = 10,
+    sku_whitelist: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """
-    Cerca prodotti nel catalogo bevande. 
+    Cerca prodotti nel catalogo bevande.
     Restituisce dati tecnici e metadati sulla ricerca effettuata.
     """
     odata_filter = _build_odata_filter(filters_json)
-    
+
+    # Se è presente una whitelist di SKU (storico ordini cliente), applica il filtro
+    if sku_whitelist:
+        sku_values = "|".join(sku_whitelist)
+        sku_filter = f"search.in(sku, '{sku_values}', '|')"
+        if odata_filter:
+            odata_filter = f"({odata_filter}) and ({sku_filter})"
+        else:
+            odata_filter = sku_filter
+
     if not query or not query.strip():
         query = "bevande" # O un termine generico che non rompa l'embedding
-    
+
     print(f"\n🔍 [RAG CALL]")
     print(f"   ├─ Motivation: {planner_motivation}")
     print(f"   ├─ Query: {query}")
     print(f"   ├─ Filters: {filters_json if filters_json else 'None'}")
+    print(f"   ├─ SKU whitelist: {len(sku_whitelist) if sku_whitelist else 0} SKU")
     print(f"   └─ K: {top_k}")
 
     try:

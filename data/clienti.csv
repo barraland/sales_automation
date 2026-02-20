@@ -1,0 +1,116 @@
+client_id,ragione_sociale,alias,agent_id,indirizzo,citta
+C001,Mario Rossi S.r.l.,Bar Mario,AG001,Via Roma 10,Milano
+C002,Pizzeria da Gigio di Luigi B.,Gigio,AG001,Corso Italia 22,Milano
+C003,Bevande e Bollicine S.p.A.,B&B,AG002,Zona Industriale,Paderno
+C004,Beck's Corner Pub,Il Pubbe,AG001,Viale Abruzzi 101,Milano
+C005,Ristorante Peroni & Figli,Da Peroni,AG001,Piazza Duomo 1,Milano
+C006,Trattoria della Nonna S.n.c.,Da Nonna,AG002,Via Garibaldi 5,Bergamo
+C007,Osteria del Porto di Luca M.,Il Porto,AG001,Via dei Pescatori 3,Genova
+C008,Sport Bar Olimpia Fan Club,Bar Olimpia,AG002,Corso Re Umberto 72,Torino
+C009,Grand Hotel Excelsior S.r.l.,Excelsior,AG001,Lungomare Italia 1,Rimini
+C010,Enoteca Toscana di Bianchi R.,L'Enoteca,AG002,Via dei Chianti 18,Firenze
+C011,Birrificio Artigianale Alpine S.n.c.,Alpine Brew,AG001,Via Alpina 34,Trento
+C012,Ristorante Il Sole Mio S.r.l.,Il Sole,AG002,Via Napoli 9,Napoli
+C013,Discoteca Paradiso di Conti P.,Paradiso,AG001,Viale Europa 200,Riccione
+C014,Albergo Ristorante Montefiore,Montefiore,AG002,Strada Statale 16,Pesaro
+C015,Pizzeria Vesuvio & Co.,Vesuvio,AG001,Piazza Dante 7,Napoli
+C016,Bar Centrale di Colombo A.,Bar Centrale,AG001,Corso Buenos Aires 14,Milano
+C017,Trattoria La Pergola S.n.c.,La Pergola,AG002,Via Volta 8,Como
+C018,Pub The Red Lion di Harris M.,Red Lion,AG001,Via Torino 55,Milano
+C019,Caffè Ambrosiano S.r.l.,Ambrosiano,AG002,Corso Matteotti 3,Varese
+C020,Pizzeria Bella Napoli di Esposito,Bella Napoli,AG001,Via Roma 21,Binasco
+C021,Ristorante Al Lago S.r.l.,Al Lago,AG002,Lungolario Trieste 9,Como
+C022,Enoteca Lombarda di Ferretti G.,Enoteca Ferretti,AG001,Via Brera 7,Milano
+C023,Birreria Artigianale MaltaMia,MaltaMia,AG002,Via Luini 12,Varese
+C024,Hotel Ristorante Villa Rosa S.r.l.,Villa Rosa,AG001,Via Garibaldi 33,Binasco
+C025,Osteria del Naviglio di Sala R.,Del Naviglio,AG002,Alzaia Naviglio Grande 44,Milano
+C026,Bar Sport di Brambilla L.,Bar Brambilla,AG001,Piazza Cavour 2,Como
+C027,Trattoria I Tigli S.n.c.,I Tigli,AG002,Via Dandolo 17,Varese
+C028,Pizzeria Da Zio Carlo,Da Zio Carlo,AG001,Via Mazzini 6,Binasco
+C029,Cocktail Bar Viveur,Viveur,AG002,Corso Sempione 88,Milano
+C030,Ristorante Il Portico di Pozzi F.,Il Portico,AG001,Via Plinio 5,Como
+C031,Caffetteria San Giovanni S.n.c.,San Giovanni,AG002,Via Cavour 19,Varese
+C032,Pub Celtic Cross di O'Brien K.,Celtic Cross,AG001,Via Vigevano 30,Milano
+C033,Agriturismo Cascina Moretti,Cascina Moretti,AG002,Via Cascina Nuova 1,Binasco
+C034,Hotel Lario S.r.l.,Hotel Lario,AG001,Lungolario Manzoni 22,Como
+C035,Bar Tabacchi Fontana,Bar Fontana,AG002,Corso Buenos Aires 77,Milano
+C036,Trattoria Al Caminetto di Ricci P.,Al Caminetto,AG001,Via Luini 40,Varese
+C037,Pizzeria Corona S.r.l.,Corona,AG002,Via Roma 14,Binasco
+C038,Ristorante La Bettola di Gallo V.,La Bettola,AG001,Via Montenapoleone 3,Milano
+C039,Osteria del Mercato S.n.c.,Del Mercato,AG002,Piazza Mercato 8,Como
+C040,Bar Nazionale di Cattaneo M.,Bar Nazionale,AG001,Corso Matteotti 55,Varese
+C041,Birreria Hopfen S.r.l.,Hopfen,AG002,Via Garibaldi 41,Binasco
+C042,Ristorante Terrazza Milano,Terrazza Milano,AG001,Via Moscova 12,Milano
+C043,Trattoria da Rosetta S.n.c.,Da Rosetta,AG002,Via Canonica 8,Como
+C044,Caffè della Piazza di Villa G.,Caffè Villa,AG001,Piazza del Popolo 3,Varese
+C045,Pub Malt Brothers,Malt Brothers,AG002,Via Mazzini 18,Binasco
+C046,Enoteca Il Calice d'Oro S.r.l.,Il Calice,AG001,Via Moscova 66,Milano
+C047,Hotel Terminus di Lombardi C.,Terminus,AG002,Viale Manzoni 4,Como
+C048,Bar Lo Spuntino di Serra A.,Lo Spuntino,AG001,Via Dandolo 9,Varese
+C049,Pizzeria I Quattro Forni,I Quattro Forni,AG002,Via Roma 55,Binasco
+C050,Ristorante Navigli Bistrot,Navigli Bistrot,AG001,Ripa di Porta Ticinese 5,Milano
+C051,Trattoria Al Ponte S.n.c.,Al Ponte,AG002,Via Volta 33,Como
+C052,Bar Duomo di Greco F.,Bar Greco,AG001,Corso Matteotti 28,Varese
+C053,Agriturismo Il Mulino S.r.l.,Il Mulino,AG002,Via Cascina Vecchia 4,Binasco
+C054,Cocktail Bar Neon Jungle,Neon Jungle,AG001,Corso Como 10,Milano
+C055,Osteria La Riva di Coppola T.,La Riva,AG002,Lungolario Lario 7,Como
+C056,Birreria La Botte S.n.c.,La Botte,AG001,Via Luini 66,Varese
+C057,Pizzeria Fuoco Vivo di Romano G.,Fuoco Vivo,AG002,Via Mazzini 30,Binasco
+C058,Ristorante Filippo al Naviglio,Da Filippo,AG001,Via Corsico 3,Milano
+C059,Bar Caffè Centrale S.r.l.,Caffè Centrale,AG002,Piazza Duomo 1,Como
+C060,Trattoria La Sosta di Moretti L.,La Sosta,AG001,Corso Matteotti 71,Varese
+C061,Pub The Queen's Head,Queen's Head,AG002,Via Roma 88,Binasco
+C062,Enoteca Bruno & Figli S.r.l.,Bruno Vini,AG001,Via Brera 20,Milano
+C063,Hotel Residence Belvedere,Belvedere,AG002,Via Boldoni 15,Como
+C064,Bar Sport Varesino di Costa R.,Bar Varesino,AG001,Via Cavallotti 5,Varese
+C065,Ristorante La Cascina di Ferri D.,La Cascina,AG002,Via Cascina 12,Binasco
+C066,Pizzeria Doppio Zero S.r.l.,Doppio Zero,AG001,Viale Bligny 42,Milano
+C067,Trattoria del Borgo S.n.c.,Del Borgo,AG002,Via Garibaldi 10,Como
+C068,Caffetteria Delle Arti di Neri B.,Delle Arti,AG001,Via Dandolo 23,Varese
+C069,Bar Ristoro Il Viaggiatore,Il Viaggiatore,AG002,Via Roma 101,Binasco
+C070,Cocktail Bar Mixology Lab S.r.l.,Mixology Lab,AG001,Via Tortona 27,Milano
+C071,Osteria Al Vapore di Motta C.,Al Vapore,AG002,Piazza Volta 6,Como
+C072,Birreria Luppoleto S.n.c.,Luppoleto,AG001,Corso Matteotti 90,Varese
+C073,Pizzeria Margherita di De Luca A.,Margherita,AG002,Via Mazzini 45,Binasco
+C074,Ristorante Il Giardino S.r.l.,Il Giardino,AG001,Via Quadronno 34,Milano
+C075,Trattoria Lo Scalco di Russo V.,Lo Scalco,AG002,Via Garibaldi 52,Como
+C076,Bar Primavera di Fontana C.,Bar Primavera,AG001,Via Luini 81,Varese
+C077,Agriturismo Cascina dei Fiori,Cascina dei Fiori,AG002,Strada Vicinale 3,Binasco
+C078,Enoteca Piemontese S.r.l.,Enoteca Piemontese,AG001,Via Solferino 11,Milano
+C079,Hotel Garden Lake di Ferrari P.,Garden Lake,AG002,Via per Cernobbio 8,Como
+C080,Pub Hannover Bier di Klein R.,Hannover Bier,AG001,Via Dandolo 44,Varese
+C081,Pizzeria Le Tegole di Conti F.,Le Tegole,AG002,Via Roma 120,Binasco
+C082,Ristorante La Veranda S.r.l.,La Veranda,AG001,Via Senato 2,Milano
+C083,Trattoria Della Vigna S.n.c.,Della Vigna,AG002,Via Volta 67,Como
+C084,Bar Rex di Cattaneo G.,Bar Rex,AG001,Corso Matteotti 110,Varese
+C085,Caffetteria Il Cortile di Sala M.,Il Cortile,AG002,Via Mazzini 60,Binasco
+C086,Cocktail Bar Eclipse S.r.l.,Eclipse,AG001,Piazza Sempione 1,Milano
+C087,Osteria Del Sole di Ferretti R.,Del Sole,AG002,Via Bellini 3,Como
+C088,Birreria BrewLab di Galli A.,BrewLab,AG001,Via Luini 95,Varese
+C089,Pizzeria Stella d'Oro S.n.c.,Stella d'Oro,AG002,Via Roma 145,Binasco
+C090,Ristorante Brasserie Meneghina,Brasserie Meneghina,AG001,Via Pontaccio 13,Milano
+C091,Trattoria La Ruota di Brambilla D.,La Ruota,AG002,Piazza Cavour 14,Como
+C092,Bar Excelsior di Pozzi L.,Bar Excelsior,AG001,Via Dandolo 60,Varese
+C093,Hotel Ristorante I Platani,I Platani,AG002,Via Vigevanese 9,Binasco
+C094,Enoteca Grandi Cru S.r.l.,Grandi Cru,AG001,Via della Moscova 45,Milano
+C095,Pub Shamrock di Murphy P.,Shamrock,AG002,Via Garibaldi 70,Como
+C096,Pizzeria Ariete di Lombardi F.,Ariete,AG001,Via Cavallotti 22,Varese
+C097,Ristorante Il Cascinale S.r.l.,Il Cascinale,AG002,Via Cascina Bassa 7,Binasco
+C098,Trattoria Al Torchio S.n.c.,Al Torchio,AG001,Corso Garibaldi 98,Milano
+C099,Bar Caffè Novecento di Serra G.,Novecento,AG002,Via Volta 88,Como
+C100,Birreria Malto & Luppolo S.r.l.,Malto & Luppolo,AG001,Corso Matteotti 130,Varese
+C101,Cocktail Bar Aperitivo DOC,Aperitivo DOC,AG002,Via Roma 170,Binasco
+C102,Ristorante La Piazzetta S.r.l.,La Piazzetta,AG001,Via Mercato 5,Milano
+C103,Osteria I Quattro Mori di Greco L.,I Quattro Mori,AG002,Via Garibaldi 88,Como
+C104,Bar Tabacchi Varese Centro,Bar Varese Centro,AG001,Via Dandolo 75,Varese
+C105,Agriturismo Corte Vecchia S.n.c.,Corte Vecchia,AG002,Via Corte Vecchia 2,Binasco
+C106,Pizzeria Grano e Fuoco S.r.l.,Grano e Fuoco,AG001,Via Torino 130,Milano
+C107,Trattoria La Quercia di Motta V.,La Quercia,AG002,Via Canonica 40,Como
+C108,Hotel Residence Varese S.r.l.,Residence Varese,AG001,Via Luini 110,Varese
+C109,Bar Il Rifugio di Coppola M.,Il Rifugio,AG002,Via Roma 190,Binasco
+C110,Enoteca Milanese S.n.c.,Enoteca Milanese,AG001,Via Solferino 33,Milano
+C111,Pub Dark Horse di Ricci A.,Dark Horse,AG002,Lungolario Manzoni 44,Como
+C112,Birreria Hoppy Days S.r.l.,Hoppy Days,AG001,Via Cavallotti 35,Varese
+C113,Pizzeria Quattro Stagioni di Neri R.,Quattro Stagioni,AG002,Via Mazzini 80,Binasco
+C114,Ristorante La Scala S.r.l.,La Scala,AG001,Via Filodrammatici 2,Milano
+C115,Trattoria Al Borgo Antico S.n.c.,Borgo Antico,AG002,Via Garibaldi 110,Como

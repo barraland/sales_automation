@@ -8,7 +8,7 @@ import re
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DB_PATH = os.path.join(BASE_DIR, "sql_lite", "db", "database_ordini.db")
 
-def search_client_smart(agent_code: str, query_text: str = None, client_id: str = None):
+def search_client_smart(agent_code: str, query_text: str = None, client_id: str = None, city_filter: str = None):
     """
     Ricerca intelligente dei clienti con supporto FTS5 e gestione errori di sintassi.
     """
@@ -35,19 +35,45 @@ def search_client_smart(agent_code: str, query_text: str = None, client_id: str 
         if client_id:
             # CASO A: Selezione diretta tramite ID (es. da bottone WhatsApp)
             cursor.execute(f"{base_query} WHERE client_id = ? AND agent_id = ?", (client_id, agent_code))
-            
+
+        elif city_filter and not query_text:
+            # CASO B1: Filtro solo per città (es. "clienti di Milano")
+            # FTS5 column-specific search: 'citta : Milano*'
+            clean_city = re.sub(r'[^\w\s]', ' ', city_filter).strip()
+            fts_city = f"citta : {clean_city}*"
+            cursor.execute(f"""
+                {base_query}
+                WHERE clienti_fts MATCH ? AND agent_id = ?
+                LIMIT 50
+            """, (fts_city, agent_code))
+
+        elif city_filter and query_text:
+            # CASO B2: Filtro per città + testo (es. "bar di Milano")
+            clean_city = re.sub(r'[^\w\s]', ' ', city_filter).strip()
+            clean_query = re.sub(r'[^\w\s]', ' ', query_text).strip()
+            words = [f"{w}*" for w in clean_query.split() if w]
+            if not words:
+                fts_query = f"citta : {clean_city}*"
+            else:
+                fts_query = " AND ".join(words) + f" AND citta : {clean_city}*"
+            cursor.execute(f"""
+                {base_query}
+                WHERE clienti_fts MATCH ? AND agent_id = ?
+                LIMIT 20
+            """, (fts_query, agent_code))
+
         elif not query_text or query_text.strip() == "*":
-            # CASO B: Lista generica (fallback)
+            # CASO C: Lista generica (fallback)
             cursor.execute(f"{base_query} WHERE agent_id = ? LIMIT 50", (agent_code,))
 
         else:
-            # CASO C: Ricerca Full-Text con pulizia per evitare crash (syntax error near ".")
+            # CASO D: Ricerca Full-Text con pulizia per evitare crash (syntax error near ".")
             # Rimuoviamo tutto ciò che non è alfanumerico o spazio
             clean_query = re.sub(r'[^\w\s]', ' ', query_text).strip()
-            
+
             # Trasformiamo in query FTS5 valida (es: "Mario Rossi" -> "Mario* AND Rossi*")
             words = [f"{w}*" for w in clean_query.split() if w]
-            
+
             if not words:
                 # Se dopo la pulizia non rimane nulla (solo simboli), restituiamo vuoto
                 return []
@@ -55,7 +81,7 @@ def search_client_smart(agent_code: str, query_text: str = None, client_id: str 
             fts_query = " AND ".join(words)
 
             cursor.execute(f"""
-                {base_query} 
+                {base_query}
                 WHERE clienti_fts MATCH ? AND agent_id = ?
                 LIMIT 20
             """, (fts_query, agent_code))

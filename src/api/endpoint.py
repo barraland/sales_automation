@@ -247,13 +247,36 @@ def send_whatsapp_message(to: str, content):
     }
 
     if hasattr(content, 'use_interactive_list') and content.use_interactive_list:
-        rows = []
-        for item in content.items[:10]:
-            rows.append({
-                "id": item.id,
-                "title": item.title[:24],
-                "description": (item.description[:72] if item.description else "")
-            })
+        # Sezioni per città (clienti) oppure lista piatta (prodotti)
+        raw_sections = getattr(content, 'sections', [])
+        if raw_sections:
+            # Multi-sezione: clienti raggruppati per città
+            wa_sections = []
+            for sec in raw_sections[:10]:
+                rows = [
+                    {
+                        "id": item.id,
+                        "title": item.title[:24],
+                        "description": (item.description[:72] if item.description else "")
+                    }
+                    for item in sec.items[:10]
+                ]
+                if rows:
+                    wa_sections.append({"title": sec.title[:24], "rows": rows})
+            header_text = "Seleziona Cliente"
+        else:
+            # Lista piatta: prodotti
+            rows = [
+                {
+                    "id": item.id,
+                    "title": item.title[:24],
+                    "description": (item.description[:72] if item.description else "")
+                }
+                for item in content.items[:10]
+            ]
+            wa_sections = [{"title": "Risultati Ricerca", "rows": rows}]
+            header_text = "Selezione Prodotti"
+
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
@@ -261,12 +284,12 @@ def send_whatsapp_message(to: str, content):
             "type": "interactive",
             "interactive": {
                 "type": "list",
-                "header": {"type": "text", "text": "Selezione Prodotti"},
+                "header": {"type": "text", "text": header_text},
                 "body": {"text": content.text},
                 "footer": {"text": "Tocca il bottone per scegliere"},
                 "action": {
                     "button": content.list_button_text[:20],
-                    "sections": [{"title": "Risultati Ricerca", "rows": rows}]
+                    "sections": wa_sections
                 }
             }
         }
@@ -345,10 +368,23 @@ async def test_chat(request: Request):
 
     response = {"text": answer.text if hasattr(answer, "text") else str(answer)}
     if getattr(answer, "use_interactive_list", False):
-        response["list"] = [
-            {"id": item.id, "title": item.title, "description": getattr(item, "description", "")}
-            for item in answer.items
-        ]
+        raw_sections = getattr(answer, "sections", [])
+        if raw_sections:
+            response["sections"] = [
+                {
+                    "title": sec.title,
+                    "items": [
+                        {"id": item.id, "title": item.title, "description": getattr(item, "description", "")}
+                        for item in sec.items
+                    ],
+                }
+                for sec in raw_sections
+            ]
+        else:
+            response["list"] = [
+                {"id": item.id, "title": item.title, "description": getattr(item, "description", "")}
+                for item in answer.items
+            ]
     return response
 
 
@@ -446,6 +482,136 @@ async def clear_logs(agent: str = None):
         return {"cleared": True, "agent": agent or "all"}
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# =============================================================================
+# ENDPOINT RESET COMPLETO
+# =============================================================================
+@app.post("/admin/reset")
+async def admin_reset():
+    """
+    Reset completo del sistema:
+    - Cancella e ricrea tutte le tabelle di database_ordini.db (ricarica clienti da CSV)
+    - Svuota i checkpoint LangGraph (checkpoints.db)
+
+    Dopo il reset ogni conversazione riparte da zero.
+    """
+    import csv as _csv
+
+    # ── 1. Reset database_ordini.db ──────────────────────────────────────────
+    try:
+        conn = sqlite3.connect(_LOG_DB)
+        cur = conn.cursor()
+        cur.execute("PRAGMA foreign_keys = OFF")
+
+        # Drop tutte le tabelle esistenti
+        for tbl in ["cart_item", "order_item", "conversation_log"]:
+            cur.execute(f"DROP TABLE IF EXISTS {tbl}")
+        cur.execute("DROP TABLE IF EXISTS [order]")
+        cur.execute("DROP TABLE IF EXISTS clienti_fts")
+
+        # Ricrea clienti_fts (FTS5)
+        cur.execute("""
+            CREATE VIRTUAL TABLE clienti_fts USING fts5(
+                client_id  UNINDEXED,
+                ragione_sociale,
+                alias,
+                agent_id   UNINDEXED,
+                indirizzo,
+                citta,
+                tokenize='unicode61'
+            )
+        """)
+
+        # Ricrea tabelle transazionali
+        cur.execute("""
+            CREATE TABLE [order] (
+                order_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_id    TEXT    NOT NULL,
+                agent_id     TEXT    NOT NULL,
+                status       TEXT    DEFAULT 'RECEIVED',
+                total_amount REAL    DEFAULT 0.0,
+                created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+                note         TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX idx_order_created_at ON [order](created_at)")
+        cur.execute("""
+            CREATE TABLE order_item (
+                item_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                order_id      INTEGER NOT NULL,
+                sku           TEXT    NOT NULL,
+                description   TEXT,
+                quantity      INTEGER NOT NULL,
+                price_at_order REAL,
+                FOREIGN KEY(order_id) REFERENCES [order](order_id) ON DELETE CASCADE
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE cart_item (
+                cart_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_id     TEXT NOT NULL,
+                client_id    TEXT NOT NULL,
+                sku          TEXT NOT NULL,
+                description  TEXT,
+                quantity     INTEGER DEFAULT 0,
+                price        REAL,
+                added_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(agent_id, client_id, sku)
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE conversation_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts          TEXT    NOT NULL,
+                sender_id   TEXT    NOT NULL,
+                agent_code  TEXT    NOT NULL,
+                user_msg    TEXT,
+                plan_json   TEXT,
+                obs_json    TEXT,
+                response    TEXT,
+                duration_ms INTEGER
+            )
+        """)
+
+        # Ricarica clienti da CSV
+        csv_path = os.path.join(_project_root, "data", "clienti.csv")
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            reader = _csv.DictReader(f)
+            clienti = [
+                (row["client_id"], row["ragione_sociale"], row["alias"],
+                 row["agent_id"], row["indirizzo"], row["citta"])
+                for row in reader
+            ]
+        cur.executemany("INSERT INTO clienti_fts VALUES (?, ?, ?, ?, ?, ?)", clienti)
+        cur.execute("PRAGMA foreign_keys = ON")
+        conn.commit()
+        conn.close()
+        n_clienti = len(clienti)
+    except Exception as e:
+        return JSONResponse({"error": f"Errore reset DB ordini: {e}"}, status_code=500)
+
+    # ── 2. Svuota checkpoints LangGraph ──────────────────────────────────────
+    _checkpoint_db = os.path.join(_project_root, "checkpoints.db")
+    try:
+        cp_conn = sqlite3.connect(_checkpoint_db)
+        for tbl in ["checkpoint_writes", "checkpoint_blobs", "checkpoints"]:
+            try:
+                cp_conn.execute(f"DELETE FROM {tbl}")
+            except sqlite3.OperationalError:
+                pass  # tabella non ancora creata, ignorabile
+        cp_conn.commit()
+        cp_conn.close()
+    except Exception as e:
+        return JSONResponse({"error": f"Errore reset checkpoint: {e}"}, status_code=500)
+
+    print("🔄 RESET COMPLETO eseguito — DB ordini ricreato, checkpoint svuotati.")
+    return {
+        "reset": True,
+        "clienti_caricati": n_clienti,
+        "db_ordini": "ricreato",
+        "checkpoints": "svuotati",
+    }
 
 
 if __name__ == "__main__":
