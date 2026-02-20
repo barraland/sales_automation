@@ -69,18 +69,10 @@ def _log_turn(
 ):
     """Scrive un record di log per ogni turno di conversazione."""
     try:
-        # Serializza piano (next_tasks) e observations
-        raw_tasks = result.get("next_tasks", [])
-        plan_list = []
-        for t in raw_tasks:
-            if hasattr(t, "model_dump"):
-                plan_list.append(t.model_dump())
-            elif hasattr(t, "__dict__"):
-                plan_list.append(t.__dict__)
-            else:
-                plan_list.append(t)
-
-        obs = result.get("observations", {})
+        # Nuovo: pending_call al posto di next_tasks/observations
+        pending = result.get("pending_call")
+        plan_list = [pending] if pending else []
+        obs = {}
 
         conn = sqlite3.connect(_LOG_DB)
         conn.execute(
@@ -201,12 +193,9 @@ def run_graph(sender_id: str, user_text: str):
     inputs = {
         "question": user_text,
         "chat_history": history,
-        "observations": {},
         "agent_code": agent_code,
         "agent_nome": agent_info.get("nome", ""),
         "agent_cognome": agent_info.get("cognome", ""),
-        "is_finished": False,
-        "next_tasks": [],
         "current_datetime": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -218,7 +207,7 @@ def run_graph(sender_id: str, user_text: str):
     history_text = answer.text if hasattr(answer, "text") else str(answer)
     new_history = history + [HumanMessage(content=user_text), AIMessage(content=history_text)]
 
-    beverage_agent.update_state(config, {"chat_history": new_history})
+    beverage_agent.update_state(config, {"chat_history": new_history, "final_answer": None})
 
     _log_turn(sender_id, agent_code, user_text, result, answer, duration_ms)
 
@@ -394,7 +383,7 @@ async def test_reset(request: Request):
     default_sender = next(iter(AGENT_MAPPING))
     sender_id = body.get("sender_id", default_sender)
     config = {"configurable": {"thread_id": sender_id}}
-    beverage_agent.update_state(config, {"chat_history": [], "observations": {}, "next_tasks": []})
+    beverage_agent.update_state(config, {"chat_history": [], "pending_call": None, "final_answer": None})
     return {"reset": True, "sender_id": sender_id}
 
 
