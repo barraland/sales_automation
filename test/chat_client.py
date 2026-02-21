@@ -27,15 +27,13 @@ def send_message(base_url: str, sender_id: str, text: str) -> dict:
         r = requests.post(
             f"{base_url}/test/chat",
             json={"sender_id": sender_id, "text": text},
-            timeout=120,
+            timeout=None,
         )
         r.raise_for_status()
         return r.json()
     except requests.exceptions.ConnectionError:
         print(f"\n❌  Impossibile connettersi a {base_url}. Il server è avviato?")
         sys.exit(1)
-    except requests.exceptions.Timeout:
-        return {"text": "⏱️  Timeout: il server non ha risposto entro 120s."}
     except Exception as e:
         return {"text": f"❌  Errore: {e}"}
 
@@ -88,8 +86,6 @@ def print_response(resp: dict, last_list: list) -> list:
                 desc = f" — {item['description']}" if item.get("description") else ""
                 print(f"      {len(flat)}. {item['title']}{desc}")
         last_list = flat
-        print()
-        print("   Digita un numero per selezionare.")
 
     elif items:
         # Lista piatta (prodotti)
@@ -99,8 +95,6 @@ def print_response(resp: dict, last_list: list) -> list:
             desc = f" — {item['description']}" if item.get("description") else ""
             print(f"   {i}. {item['title']}{desc}  [id: {item['id']}]")
         last_list = items
-        print()
-        print("   Digita un numero per selezionare.")
 
     print("─" * 60)
     print()

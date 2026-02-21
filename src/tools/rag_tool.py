@@ -110,6 +110,67 @@ def _azure_search_retrieve(query: str, top_k: int, odata_filter: Optional[str]) 
     return [dict(r) for r in results]
 
 # ---------------------------------------------------------
+# LLM Reranker
+# ---------------------------------------------------------
+
+def _llm_rerank(query: str, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Filtra i candidati RAG con un LLM: per ogni prodotto decide se è
+    plausibilmente ciò che l'utente cerca (sì/no strutturato).
+    Ritorna i candidati "sì". Se tutti vengono scartati, ritorna tutti (fallback).
+    """
+    if len(candidates) <= 1:
+        return candidates
+
+    client = get_openai_client()
+
+    cand_lines = "\n".join(
+        f"{i+1}. SKU={c.get('sku')} | Brand={c.get('brand')} | "
+        f"Descrizione={c.get('descrizione')} | Formato={c.get('formato')} | "
+        f"Categoria={c.get('categoria')}"
+        for i, c in enumerate(candidates)
+    )
+
+    prompt = (
+        f"Sei un assistente catalogo bevande Horeca. Un agente commerciale ha cercato: \"{query}\"\n\n"
+        f"Il motore di ricerca Azure AI Search ha restituito questi candidati:\n{cand_lines}\n\n"
+        f"Per ogni candidato, decidi se è plausibile che sia il prodotto cercato dall'agente.\n\n"
+        f"REGOLE:\n"
+        f"- Sii tollerante a typo e varianti ortografiche "
+        f"(es. 'Ichnuza non filtra' = 'Ichnusa non filtrata', 'Martni' = 'Martini')\n"
+        f"- PRIORITÀ MASSIMA a brand e tipologia: se l'utente cerca 'Martini Rosso', "
+        f"solo prodotti del brand Martini & Rossi sono validi — altri brand che contengono "
+        f"'rosso' nel nome NON sono accettabili\n"
+        f"- Formato/volume diverso dello stesso prodotto È accettabile "
+        f"(es. 33cl vs 50cl della stessa birra), a meno che il formato non sia parte della query utente.\n"
+        f"- Se la query indica solo il brand senza tipologia specifica, includi tutte le varianti\n\n"
+        f"Rispondi SOLO con un JSON array: "
+        f'[{{"sku": "SKU1", "match": true}}, {{"sku": "SKU2", "match": false}}, ...]'
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        raw = json.loads(resp.choices[0].message.content)
+        # json_object mode wrappa in dict — estrai la lista
+        items = raw if isinstance(raw, list) else next(
+            (v for v in raw.values() if isinstance(v, list)), []
+        )
+        match_skus = {item["sku"] for item in items if item.get("match")}
+        filtered = [c for c in candidates if c.get("sku") in match_skus]
+        kept = filtered if filtered else candidates   # fallback: non eliminare tutto
+        print(f"   🤖 [RERANK] {len(candidates)} → {len(kept)} candidati")
+        return kept
+    except Exception as e:
+        print(f"   ⚠️ [RERANK ERROR]: {e}")
+        return candidates
+
+
+# ---------------------------------------------------------
 # Tool Definition
 # ---------------------------------------------------------
 @tool
@@ -119,6 +180,7 @@ def search_product_smart(
     filters_json: str = "",
     top_k: int = 10,
     sku_whitelist: Optional[List[str]] = None,
+    llm_rerank: bool = True,
 ) -> Dict[str, Any]:
     """
     Cerca prodotti nel catalogo bevande.
@@ -143,14 +205,15 @@ def search_product_smart(
     print(f"   ├─ Query: {query}")
     print(f"   ├─ Filters: {filters_json if filters_json else 'None'}")
     print(f"   ├─ SKU whitelist: {len(sku_whitelist) if sku_whitelist else 0} SKU")
+    print(f"   ├─ LLM rerank: {llm_rerank and not sku_whitelist}")
     print(f"   └─ K: {top_k}")
 
     try:
         docs = _azure_search_retrieve(query, top_k, odata_filter)
-        
+
         results = []
         found_brands = set()
-        
+
         for d in docs:
             found_brands.add(str(d.get("brand", "Unknown")))
             results.append({
@@ -162,7 +225,12 @@ def search_product_smart(
                 "stock": d.get("disponibilita"),
                 "categoria": d.get("categoria")
             })
-        
+
+        # LLM reranking: filtra candidati non pertinenti (skip se sku_whitelist già filtra)
+        if llm_rerank and not sku_whitelist and results:
+            results = _llm_rerank(query, results)
+            found_brands = {c.get("brand", "Unknown") for c in results}
+
         rag_motivation = ""
         if len(results) > 0:
             rag_motivation = f"Ho trovato {len(results)} prodotti corrispondenti dei brand: {', '.join(found_brands)}."
@@ -171,7 +239,7 @@ def search_product_smart(
 
         print(f"✅ [RAG RESULT]")
         print(f"   └─ {rag_motivation}")
-        
+
         return {
             "results": results,
             "metadata": {
