@@ -50,21 +50,14 @@ def merge_node(state: AgentState) -> dict:
     if not has_cart_view and len(responses) == 1:
         final = responses[0]
     elif not has_cart_view and len(lists) > 1:
-        # Più tool call con lista: unisce tutte le sezioni/items in un'unica lista interattiva
-        merged_sections: list = []
-        for resp in lists:
-            if resp.sections:
-                merged_sections.extend(resp.sections)
-            elif resp.items:
-                # Usa la prima riga del testo come titolo sezione (max 24 char WhatsApp)
-                title = resp.text.split("\n")[0][:24].rstrip(":")
-                merged_sections.append(WhatsAppSection(title=title, items=resp.items))
-        # Solo la riga intro di ogni risposta (evita doppione numeri con la lista interattiva)
-        combined_text = "\n\n".join(r.text.split("\n")[0] for r in non_empty)
+        # Sequenziale: mostra solo la PRIMA disambiguazione.
+        # Le altre restano come pending_call e verranno riproposte al turno successivo.
+        first = lists[0]
         final = FinalResponse(
-            text=combined_text,
+            text=first.text,
             use_interactive_list=True,
-            sections=merged_sections,
+            sections=first.sections or [],
+            items=first.items or [],
         )
     else:
         last_list     = lists[-1] if lists else None

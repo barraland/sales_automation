@@ -1,0 +1,163 @@
+# Schema del database SQLite per il Text-to-SQL agent (query_database tool).
+# Modificare qui per aggiornare il contesto del LLM senza toccare il codice Python.
+# Il placeholder {AGENT} viene sostituito a runtime con il codice agente (es. 'AG001').
+
+tables:
+  prodotti:
+    note: "catalogo bevande condiviso — nessun filtro agent_id"
+    agent_filter: false
+    columns:
+      sku:               "TEXT PK — codice univoco (es. 'BIR-HEI-CLA-33V')"
+      descrizione:       "TEXT — nome commerciale (es. 'Heineken Classica 33cl')"
+      brand:             "TEXT — marchio (es. 'Heineken','Martini','San Pellegrino')"
+      categoria:         "TEXT — 'Alcolici','Soft Drinks','Acque','Succhi','Energy Drinks','Vini','Aperitivi','Superalcolici'"
+      sottocategoria:    "TEXT — es. 'Birra','Cola','Naturale','Vino Rosso','Vermouth','Gin'"
+      famiglia:          "TEXT — es. 'Birra Lager','Acqua Minerale'"
+      formato:           "TEXT — volume unitario (es. '33cl','50cl','75cl','1L','1.5L')"
+      confezione:        "TEXT — tipo imballo (es. 'Lattina','Bottiglia vetro','PET')"
+      prezzo_unitario:   "REAL — prezzo per unità (€)"
+      prezzo_confezione: "TEXT — prezzo per confezione formattato (es. '24x €0.85')"
+      disponibilita:     "REAL — giacenza magazzino (unità)"
+      note_ricerca:      "TEXT — tag aggiuntivi per ricerca"
+
+  clienti_fts:
+    note: "anagrafica clienti — virtual FTS5, usabile con SELECT normale"
+    agent_filter: true
+    columns:
+      client_id:       "TEXT — ID cliente (es. 'C001','C022')"
+      ragione_sociale: "TEXT — nome legale (es. 'Mario Rossi S.r.l.')"
+      alias:           "TEXT — nome breve/commerciale (es. 'Bar Mario')"
+      agent_id:        "TEXT — ID agente proprietario (filtrare SEMPRE agent_id='{AGENT}')"
+      indirizzo:       "TEXT — via e numero civico"
+      citta:           "TEXT — città (es. 'Milano','Como','Varese')"
+
+  "[order]":
+    note: "testata ordini — SEMPRE parentesi quadre nel SQL"
+    agent_filter: true
+    columns:
+      order_id:     "INTEGER PK AUTOINCREMENT"
+      client_id:    "TEXT FK→clienti_fts.client_id"
+      agent_id:     "TEXT — ID agente (filtrare SEMPRE agent_id='{AGENT}')"
+      status:       "TEXT — stato ordine: 'RECEIVED' (unico valore attuale)"
+      total_amount: "REAL — importo totale ordine (€)"
+      created_at:   "DATETIME ISO 8601 UTC (es. '2026-01-15 10:30:00') — usa strftime('%Y-%m',created_at) per filtrare per mese/anno"
+      note:         "TEXT — note libere sull'ordine"
+
+  order_item:
+    note: "righe ordine — per filtrare per agente fare JOIN con [order]"
+    agent_filter: false
+    columns:
+      item_id:        "INTEGER PK AUTOINCREMENT"
+      order_id:       "INTEGER FK→[order].order_id ON DELETE CASCADE"
+      sku:            "TEXT FK→prodotti.sku"
+      description:    "TEXT — descrizione prodotto al momento dell'ordine"
+      quantity:       "INTEGER — quantità ordinata"
+      price_at_order: "REAL — prezzo unitario al momento dell'ordine (€)"
+
+  cart_item:
+    note: "carrello corrente (sandbox, ordine non ancora confermato)"
+    agent_filter: true
+    columns:
+      cart_item_id: "INTEGER PK AUTOINCREMENT"
+      agent_id:     "TEXT — ID agente (filtrare SEMPRE agent_id='{AGENT}')"
+      client_id:    "TEXT FK→clienti_fts.client_id"
+      sku:          "TEXT FK→prodotti.sku"
+      description:  "TEXT — descrizione prodotto"
+      quantity:     "INTEGER — quantità nel carrello"
+      price:        "REAL — prezzo corrente (€)"
+      added_at:     "DATETIME — timestamp aggiunta"
+
+  sconti:
+    note: "sconti negoziati per coppia cliente×SKU — PK(client_id, sku), ~20% delle combinazioni"
+    agent_filter: false
+    columns:
+      client_id:  "TEXT PK FK→clienti_fts.client_id — ID cliente"
+      sku:        "TEXT PK FK→prodotti.sku — codice prodotto"
+      sconto_pct: "REAL — sconto percentuale (es. 15.5 per 15.5%), range 5–30"
+
+joins:
+  - "[order].client_id    = clienti_fts.client_id"
+  - "[order].order_id     = order_item.order_id"
+  - "order_item.sku       = prodotti.sku"
+  - "cart_item.client_id  = clienti_fts.client_id"
+  - "cart_item.sku        = prodotti.sku"
+  - "sconti.client_id     = clienti_fts.client_id"
+  - "sconti.sku           = prodotti.sku"
+
+examples:
+  - desc: "Totale fatturato per cliente (decrescente)"
+    sql: |
+      SELECT c.alias, SUM(o.total_amount) AS totale
+      FROM [order] o JOIN clienti_fts c ON o.client_id=c.client_id
+      WHERE o.agent_id='{AGENT}' GROUP BY o.client_id ORDER BY totale DESC
+
+  - desc: "Prodotti più ordinati per quantità"
+    sql: |
+      SELECT oi.description, SUM(oi.quantity) AS qta,
+             ROUND(SUM(oi.quantity*oi.price_at_order),2) AS fatturato
+      FROM order_item oi JOIN [order] o ON oi.order_id=o.order_id
+      WHERE o.agent_id='{AGENT}' GROUP BY oi.sku ORDER BY qta DESC LIMIT 10
+
+  - desc: "Clienti di una città con almeno un ordine"
+    sql: |
+      SELECT DISTINCT c.alias, c.ragione_sociale, c.citta
+      FROM clienti_fts c JOIN [order] o ON c.client_id=o.client_id
+      WHERE c.citta='Milano' COLLATE NOCASE AND o.agent_id='{AGENT}'
+
+  - desc: "Brand disponibili per categoria (es. Succhi)"
+    sql: |
+      SELECT DISTINCT brand FROM prodotti
+      WHERE categoria='Succhi' COLLATE NOCASE ORDER BY brand
+
+  - desc: "Ordini del mese corrente con cliente"
+    sql: |
+      SELECT o.order_id, c.alias, o.total_amount, o.created_at
+      FROM [order] o JOIN clienti_fts c ON o.client_id=c.client_id
+      WHERE o.agent_id='{AGENT}'
+        AND strftime('%Y-%m', o.created_at)=strftime('%Y-%m','now')
+      ORDER BY o.created_at DESC
+
+  - desc: "Dettaglio righe di un ordine specifico"
+    sql: |
+      SELECT oi.description, oi.quantity, oi.price_at_order,
+             ROUND(oi.quantity*oi.price_at_order,2) AS subtotale
+      FROM order_item oi JOIN [order] o ON oi.order_id=o.order_id
+      WHERE o.order_id=42 AND o.agent_id='{AGENT}'
+
+  - desc: "Prodotti sotto una soglia di prezzo"
+    sql: |
+      SELECT descrizione, brand, formato, prezzo_unitario
+      FROM prodotti WHERE prezzo_unitario < 2.0 ORDER BY prezzo_unitario
+
+  - desc: "Numero clienti per città"
+    sql: |
+      SELECT citta, COUNT(*) AS num_clienti
+      FROM clienti_fts WHERE agent_id='{AGENT}'
+      GROUP BY citta ORDER BY num_clienti DESC
+
+  - desc: "Fatturato totale per categoria prodotto"
+    sql: |
+      SELECT p.categoria, ROUND(SUM(oi.quantity*oi.price_at_order),2) AS fatturato
+      FROM order_item oi
+      JOIN [order] o ON oi.order_id=o.order_id
+      JOIN prodotti p ON oi.sku=p.sku
+      WHERE o.agent_id='{AGENT}'
+      GROUP BY p.categoria ORDER BY fatturato DESC
+
+  - desc: "Sconto di un cliente su un prodotto specifico"
+    sql: |
+      SELECT c.alias, p.descrizione, s.sconto_pct
+      FROM sconti s
+      JOIN clienti_fts c ON s.client_id=c.client_id
+      JOIN prodotti p ON s.sku=p.sku
+      WHERE c.alias='Bar Mario' COLLATE NOCASE
+
+  - desc: "Prodotti con sconto per un cliente, con prezzo scontato"
+    sql: |
+      SELECT p.descrizione, p.brand, p.prezzo_unitario,
+             s.sconto_pct,
+             ROUND(p.prezzo_unitario*(1-s.sconto_pct/100.0),2) AS prezzo_scontato
+      FROM sconti s
+      JOIN prodotti p ON s.sku=p.sku
+      WHERE s.client_id='C001'
+      ORDER BY s.sconto_pct DESC

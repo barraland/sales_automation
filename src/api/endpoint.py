@@ -205,6 +205,26 @@ def run_graph(sender_id: str, user_text: str):
 
     answer = result.get("final_answer", "Non ho trovato informazioni specifiche.")
     history_text = answer.text if hasattr(answer, "text") else str(answer)
+
+    # Se la risposta ha una lista interattiva, appende items numerati (con ID/SKU) al testo
+    # della chat_history così il dispatcher può risolvere "la 1 ed il 4" al turno successivo
+    # senza ri-fare RAG. Il contatore è globale attraverso tutte le sezioni.
+    _sections   = getattr(answer, "sections", None) or []
+    _loose      = getattr(answer, "items", None) or []
+    if not _sections and _loose:
+        from src.graph.shared import WhatsAppSection
+        _sections = [WhatsAppSection(title="", items=_loose)]
+    if _sections and any(s.items for s in _sections):
+        _lines, _n = [], 1
+        for _sec in _sections:
+            for _item in (_sec.items or []):
+                _id   = f" [{_item.id}]" if _item.id else ""
+                _desc = f" — {_item.description}" if _item.description else ""
+                _lines.append(f"  {_n}. {_item.title}{_id}{_desc}")
+                _n += 1
+        if _lines:
+            history_text = history_text + "\n" + "\n".join(_lines)
+
     new_history = history + [HumanMessage(content=user_text), AIMessage(content=history_text)]
 
     beverage_agent.update_state(config, {"chat_history": new_history, "final_answer": None})
@@ -220,14 +240,81 @@ def process_and_respond(sender_id: str, user_text: str):
     print(f"💬 TESTO: {user_text}")
     print("="*40)
 
+    agent_code = AGENT_MAPPING.get(sender_id, "AG001")
     answer = run_graph(sender_id, user_text)
-    send_whatsapp_message(sender_id, answer)
+    send_whatsapp_message(sender_id, answer, agent_code=agent_code)
+
+
+# =============================================================================
+# OVERFLOW EMAIL (risultati troppo lunghi per WhatsApp)
+# =============================================================================
+def send_overflow_email(agent_code: str, subject: str, full_text: str, raw_data: list = None):
+    """Invia il risultato completo via email con eventuale allegato Excel."""
+    from src.graph.shared import agent_email_map
+    gmail_from     = os.getenv("GMAIL_FROM", "")
+    gmail_password = os.getenv("GMAIL_APP_PASSWORD", "")
+    if not gmail_from or not gmail_password:
+        print("⚠️ [OVERFLOW EMAIL] Credenziali Gmail non configurate — email non inviata")
+        return
+    to_addr = agent_email_map.get(agent_code, gmail_from)
+
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    from email.mime.base import MIMEBase
+    from email import encoders
+    import smtplib
+    import io
+
+    msg = MIMEMultipart()
+    msg["Subject"] = subject
+    msg["From"]    = gmail_from
+    msg["To"]      = to_addr
+    msg.attach(MIMEText(full_text, "plain", "utf-8"))
+
+    if raw_data:
+        try:
+            import openpyxl
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.append(list(raw_data[0].keys()))
+            for row in raw_data:
+                ws.append(list(row.values()))
+            buf = io.BytesIO()
+            wb.save(buf)
+            buf.seek(0)
+            part = MIMEBase("application", "vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            part.set_payload(buf.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", 'attachment; filename="risultato.xlsx"')
+            msg.attach(part)
+        except ImportError:
+            import csv as _csv
+            buf = io.StringIO()
+            writer = _csv.DictWriter(buf, fieldnames=list(raw_data[0].keys()))
+            writer.writeheader()
+            writer.writerows(raw_data)
+            csv_part = MIMEText(buf.getvalue(), "plain", "utf-8")
+            csv_part.add_header("Content-Disposition", 'attachment; filename="risultato.csv"')
+            msg.attach(csv_part)
+
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+            s.login(gmail_from, gmail_password)
+            s.send_message(msg)
+        print(f"📧 [OVERFLOW EMAIL] Inviata a {to_addr}")
+    except Exception as e:
+        print(f"⚠️ [OVERFLOW EMAIL ERROR]: {e}")
 
 
 # =============================================================================
 # WHATSAPP SENDER
 # =============================================================================
-def send_whatsapp_message(to: str, content):
+_WA_BODY_INTERACTIVE = 900   # max char body lista interattiva prima di overflow email
+_WA_BODY_TEXT        = 3500  # max char testo semplice prima di overflow email
+_WA_MAX_ROWS         = 10    # max righe totali lista interattiva
+
+
+def send_whatsapp_message(to: str, content, agent_code: str = ""):
     """Funzione universale Meta Cloud API."""
     url = f"https://graph.facebook.com/v22.0/{PHONE_NUMBER_ID}/messages"
     headers = {
@@ -239,32 +326,68 @@ def send_whatsapp_message(to: str, content):
         # Sezioni per città (clienti) oppure lista piatta (prodotti)
         raw_sections = getattr(content, 'sections', [])
         if raw_sections:
-            # Multi-sezione: clienti raggruppati per città
+            # Multi-sezione: clienti raggruppati per città — cap a _WA_MAX_ROWS righe totali
+            all_items_count = sum(len(sec.items) for sec in raw_sections)
             wa_sections = []
+            total_rows = 0
             for sec in raw_sections[:10]:
-                rows = [
-                    {
+                if total_rows >= _WA_MAX_ROWS:
+                    break
+                rows = []
+                for item in sec.items:
+                    if total_rows >= _WA_MAX_ROWS:
+                        break
+                    rows.append({
                         "id": item.id,
                         "title": item.title[:24],
                         "description": (item.description[:72] if item.description else "")
-                    }
-                    for item in sec.items[:10]
-                ]
+                    })
+                    total_rows += 1
                 if rows:
                     wa_sections.append({"title": sec.title[:24], "rows": rows})
             header_text = "Seleziona Cliente"
+
+            # Overflow per righe troncate: invia email con lista completa
+            if all_items_count > _WA_MAX_ROWS:
+                print(f"   📋 [OVERFLOW ROWS] {all_items_count} clienti > max {_WA_MAX_ROWS} — invio email a agent_code={agent_code!r}")
+                send_overflow_email(
+                    agent_code,
+                    f"Lista clienti completa ({all_items_count} totali)",
+                    "\n".join(
+                        f"{r.get('alias') or r.get('ragione_sociale') or r.get('client_id','')} "
+                        f"— {r.get('citta','')} ({r.get('client_id','')})"
+                        for r in (getattr(content, "raw_data", None) or [])
+                    ),
+                    getattr(content, "raw_data", None),
+                )
         else:
-            # Lista piatta: prodotti
+            # Lista piatta: prodotti — max _WA_MAX_ROWS
             rows = [
                 {
                     "id": item.id,
                     "title": item.title[:24],
                     "description": (item.description[:72] if item.description else "")
                 }
-                for item in content.items[:10]
+                for item in content.items[:_WA_MAX_ROWS]
             ]
             wa_sections = [{"title": "Risultati Ricerca", "rows": rows}]
             header_text = "Selezione Prodotti"
+            all_items_count = len(content.items)
+
+        # Overflow: body troppo lungo per WhatsApp
+        body_text = content.text or " "
+        rows_truncated = raw_sections and all_items_count > _WA_MAX_ROWS
+        if rows_truncated:
+            body_text = body_text.rstrip() + f"\n⚠️ Mostrati {_WA_MAX_ROWS}/{all_items_count} — lista completa inviata via email."
+        elif len(body_text) > _WA_BODY_INTERACTIVE:
+            full_text = body_text
+            body_text = body_text[:_WA_BODY_INTERACTIVE - 40] + "…\n📧 Risultato completo inviato via email."
+            send_overflow_email(
+                agent_code, "Risultato completo", full_text,
+                getattr(content, "raw_data", None)
+            )
+        if not body_text.strip():
+            body_text = " "
 
         payload = {
             "messaging_product": "whatsapp",
@@ -274,7 +397,7 @@ def send_whatsapp_message(to: str, content):
             "interactive": {
                 "type": "list",
                 "header": {"type": "text", "text": header_text},
-                "body": {"text": content.text},
+                "body": {"text": body_text},
                 "footer": {"text": "Tocca il bottone per scegliere"},
                 "action": {
                     "button": content.list_button_text[:20],
@@ -284,7 +407,14 @@ def send_whatsapp_message(to: str, content):
         }
     else:
         text_body = content.text if hasattr(content, 'text') else str(content)
-        if len(text_body) > 4000:
+        if len(text_body) > _WA_BODY_TEXT:
+            full_text = text_body
+            text_body = text_body[:_WA_BODY_TEXT - 40] + "…\n📧 Risultato completo inviato via email."
+            send_overflow_email(
+                agent_code, "Risultato completo", full_text,
+                getattr(content, "raw_data", None)
+            )
+        elif len(text_body) > 4000:
             text_body = text_body[:3997] + "..."
         payload = {
             "messaging_product": "whatsapp",
@@ -377,13 +507,15 @@ async def test_chat(request: Request):
     return response
 
 
-@app.delete("/test/chat")
-async def test_reset(request: Request):
+@app.delete("/test/reset_chat")
+async def test_reset_chat(request: Request):
+    """Resetta chat history e pending_call per un sender_id."""
     body = await request.json()
     default_sender = next(iter(AGENT_MAPPING))
     sender_id = body.get("sender_id", default_sender)
     config = {"configurable": {"thread_id": sender_id}}
     beverage_agent.update_state(config, {"chat_history": [], "pending_call": None, "final_answer": None})
+    print(f"🔄 RESET CHAT per {sender_id}")
     return {"reset": True, "sender_id": sender_id}
 
 
@@ -476,107 +608,25 @@ async def clear_logs(agent: str = None):
 # =============================================================================
 # ENDPOINT RESET COMPLETO
 # =============================================================================
-@app.post("/admin/reset")
-async def admin_reset():
+@app.post("/admin/reset_db")
+async def admin_reset_db():
     """
     Reset completo del sistema:
-    - Cancella e ricrea tutte le tabelle di database_ordini.db (ricarica clienti da CSV)
+    - Droppa e ricrea tutte le tabelle di database_ordini.db via setup_full_database()
     - Svuota i checkpoint LangGraph (checkpoints.db)
 
     Dopo il reset ogni conversazione riparte da zero.
     """
-    import csv as _csv
+    import importlib.util
+    _script = os.path.join(_project_root, "sql_lite", "scripts",
+                           "create_database_ordini._anagrafica_cli.py")
+    spec = importlib.util.spec_from_file_location("_setup_db", _script)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
 
-    # ── 1. Reset database_ordini.db ──────────────────────────────────────────
+    # ── 1. Ricrea database_ordini.db ─────────────────────────────────────────
     try:
-        conn = sqlite3.connect(_LOG_DB)
-        cur = conn.cursor()
-        cur.execute("PRAGMA foreign_keys = OFF")
-
-        # Drop tutte le tabelle esistenti
-        for tbl in ["cart_item", "order_item", "conversation_log"]:
-            cur.execute(f"DROP TABLE IF EXISTS {tbl}")
-        cur.execute("DROP TABLE IF EXISTS [order]")
-        cur.execute("DROP TABLE IF EXISTS clienti_fts")
-
-        # Ricrea clienti_fts (FTS5)
-        cur.execute("""
-            CREATE VIRTUAL TABLE clienti_fts USING fts5(
-                client_id  UNINDEXED,
-                ragione_sociale,
-                alias,
-                agent_id   UNINDEXED,
-                indirizzo,
-                citta,
-                tokenize='unicode61'
-            )
-        """)
-
-        # Ricrea tabelle transazionali
-        cur.execute("""
-            CREATE TABLE [order] (
-                order_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                client_id    TEXT    NOT NULL,
-                agent_id     TEXT    NOT NULL,
-                status       TEXT    DEFAULT 'RECEIVED',
-                total_amount REAL    DEFAULT 0.0,
-                created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
-                note         TEXT
-            )
-        """)
-        cur.execute("CREATE INDEX idx_order_created_at ON [order](created_at)")
-        cur.execute("""
-            CREATE TABLE order_item (
-                item_id       INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id      INTEGER NOT NULL,
-                sku           TEXT    NOT NULL,
-                description   TEXT,
-                quantity      INTEGER NOT NULL,
-                price_at_order REAL,
-                FOREIGN KEY(order_id) REFERENCES [order](order_id) ON DELETE CASCADE
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE cart_item (
-                cart_item_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                agent_id     TEXT NOT NULL,
-                client_id    TEXT NOT NULL,
-                sku          TEXT NOT NULL,
-                description  TEXT,
-                quantity     INTEGER DEFAULT 0,
-                price        REAL,
-                added_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(agent_id, client_id, sku)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE conversation_log (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                ts          TEXT    NOT NULL,
-                sender_id   TEXT    NOT NULL,
-                agent_code  TEXT    NOT NULL,
-                user_msg    TEXT,
-                plan_json   TEXT,
-                obs_json    TEXT,
-                response    TEXT,
-                duration_ms INTEGER
-            )
-        """)
-
-        # Ricarica clienti da CSV
-        csv_path = os.path.join(_project_root, "data", "clienti.csv")
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            reader = _csv.DictReader(f)
-            clienti = [
-                (row["client_id"], row["ragione_sociale"], row["alias"],
-                 row["agent_id"], row["indirizzo"], row["citta"])
-                for row in reader
-            ]
-        cur.executemany("INSERT INTO clienti_fts VALUES (?, ?, ?, ?, ?, ?)", clienti)
-        cur.execute("PRAGMA foreign_keys = ON")
-        conn.commit()
-        conn.close()
-        n_clienti = len(clienti)
+        mod.setup_full_database()
     except Exception as e:
         return JSONResponse({"error": f"Errore reset DB ordini: {e}"}, status_code=500)
 
@@ -594,10 +644,9 @@ async def admin_reset():
     except Exception as e:
         return JSONResponse({"error": f"Errore reset checkpoint: {e}"}, status_code=500)
 
-    print("🔄 RESET COMPLETO eseguito — DB ordini ricreato, checkpoint svuotati.")
+    print("🔄 RESET DB COMPLETO — database ricreato, checkpoint svuotati.")
     return {
         "reset": True,
-        "clienti_caricati": n_clienti,
         "db_ordini": "ricreato",
         "checkpoints": "svuotati",
     }

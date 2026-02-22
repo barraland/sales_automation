@@ -8,6 +8,7 @@ import csv
 import json
 import re
 import sqlite3
+import yaml
 import smtplib
 import logging
 from datetime import datetime
@@ -22,7 +23,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 from typing_extensions import TypedDict
 
-from src.tools.rag_tool import search_product_smart, get_catalog_facets
+from src.tools.rag_tool import search_product_smart, get_catalog_facets, get_openai_client
 from src.tools.rag_tool_anagrafica_clienti import search_client_smart
 
 load_dotenv()
@@ -60,6 +61,37 @@ facets = get_catalog_facets(facet_fields=["brand", "categoria", "sottocategoria"
 brand_values          = facets.get("brand", [])
 categoria_values      = facets.get("categoria", [])
 sottocategoria_values = facets.get("sottocategoria", [])
+
+
+# =============================================================================
+# VALORI DISCRETI PER TEXT-TO-SQL (caricati da SQLite all'avvio)
+# =============================================================================
+def _load_discrete_values() -> str:
+    """Valori distinti dei campi discreti, caricati da SQLite all'avvio."""
+    db_path = os.path.join(_project_root, "sql_lite", "db", "database_ordini.db")
+    conn = sqlite3.connect(db_path)
+    fields = {
+        "prodotti.brand":          "SELECT DISTINCT brand FROM prodotti WHERE brand IS NOT NULL ORDER BY brand",
+        "prodotti.categoria":      "SELECT DISTINCT categoria FROM prodotti WHERE categoria IS NOT NULL ORDER BY categoria",
+        "prodotti.sottocategoria": "SELECT DISTINCT sottocategoria FROM prodotti WHERE sottocategoria IS NOT NULL ORDER BY sottocategoria",
+        "prodotti.famiglia":       "SELECT DISTINCT famiglia FROM prodotti WHERE famiglia IS NOT NULL ORDER BY famiglia",
+        "prodotti.formato":        "SELECT DISTINCT formato FROM prodotti WHERE formato IS NOT NULL ORDER BY formato",
+        "prodotti.confezione":     "SELECT DISTINCT confezione FROM prodotti WHERE confezione IS NOT NULL ORDER BY confezione",
+        "clienti_fts.citta":       "SELECT DISTINCT citta FROM clienti_fts WHERE citta IS NOT NULL ORDER BY citta",
+    }
+    lines = ["VALORI AMMESSI per campi discreti (usa SOLO questi nei filtri WHERE):"]
+    for label, query in fields.items():
+        try:
+            rows = conn.execute(query).fetchall()
+            values = [str(r[0]) for r in rows if r[0]]
+            if values:
+                lines.append(f"  {label}: {', '.join(values)}")
+        except Exception:
+            pass
+    conn.close()
+    return "\n".join(lines)
+
+_DISCRETE_VALUES = _load_discrete_values()
 
 
 # =============================================================================
@@ -103,6 +135,7 @@ class FinalResponse(BaseModel):
     list_button_text: str = "Vedi opzioni"
     items: List[WhatsAppListItem] = []
     sections: List[WhatsAppSection] = []
+    raw_data: Optional[List[Dict[str, Any]]] = None  # per allegato email overflow
 
 
 # =============================================================================
@@ -160,6 +193,18 @@ class list_orders(BaseModel):
     client_ref: Optional[str] = Field(None, description="Nome o client_id del cliente. None per tutti gli ordini.")
 
 
+class query_database(BaseModel):
+    """Interroga il database (prodotti, clienti, ordini) con query strutturate.
+    Usare per domande aggregate o cross-tabella:
+    'quali brand di succhi?', 'prodotti sotto €2', 'quante birre abbiamo?',
+    'clienti di Milano con ordini?', 'totale venduto per categoria',
+    'ordini di Bar Mario', 'quante Ichnusa ha ordinato Bar Mario questa settimana'.
+    NON usare per ricerca semantica di un singolo prodotto (usa search_products)."""
+    question:     str           = Field(description="Domanda in linguaggio naturale sul database")
+    client_hint:  Optional[str] = Field(default=None, description="Nome o alias del cliente menzionato nella domanda (es. 'Bar Mario') — il motore risolve client_id via FTS5 e lo inietta nel prompt SQL")
+    product_hint: Optional[str] = Field(default=None, description="Nome del prodotto menzionato nella domanda (es. 'Ichnusa non filtrata') — il motore risolve lo SKU via RAG e lo inietta nel prompt SQL")
+
+
 class free_response(BaseModel):
     """Risposta libera: benvenuto al primo accesso, out-of-scope, spiegazione capacità, casi non coperti da altri tool."""
     text: str = Field(description="Testo della risposta in italiano, conciso (max 3 righe)")
@@ -167,8 +212,11 @@ class free_response(BaseModel):
 
 ALL_TOOLS = [
     add_to_cart, remove_from_cart, clear_cart, view_cart, confirm_order,
-    list_clients, search_products, list_orders, free_response,
+    list_clients, search_products, query_database, list_orders, free_response,
 ]
+
+# Tool esposti all'LLM nel dispatcher — list_orders è nascosto (usa query_database)
+DISPATCHER_TOOLS = [t for t in ALL_TOOLS if t.__name__ != "list_orders"]
 
 TOOL_NODE_NAMES = [t.__name__ for t in ALL_TOOLS]
 
@@ -423,6 +471,7 @@ def _cart_text(cart_items: list, client_name: str = "") -> str:
 
 
 def _group_clients_by_city(results: list) -> List[WhatsAppSection]:
+    """Raggruppa tutti i clienti per città senza cap — il troncamento avviene in send_whatsapp_message."""
     grouped: Dict[str, list] = {}
     for r in results:
         city = r.get("citta") or "Altro"
@@ -435,11 +484,11 @@ def _group_clients_by_city(results: list) -> List[WhatsAppSection]:
                 title=(r.get("alias") or r.get("ragione_sociale") or r["client_id"])[:24],
                 description=(r.get("ragione_sociale") or "")[:72],
             )
-            for r in grouped[city][:10]
+            for r in grouped[city]
         ]
         if items:
             sections.append(WhatsAppSection(title=city, items=items))
-    return sections[:10]
+    return sections
 
 
 def _product_items(results: list) -> List[WhatsAppListItem]:
@@ -779,8 +828,10 @@ def impl_confirm_order(client_ref, agent_code, known_clients, known_products):
         return f"• {desc} × {qty}"
     items_txt = "\n".join(_wa_line(r) for r in items)
     send_order_email(result, upd_c, agent_code)
+    agent_email = agent_email_map.get(agent_code, "")
+    email_note  = f"\n📧 Mail di conferma mandata a {agent_email}" if agent_email else ""
     return _ok(
-        FinalResponse(text=f"✅ Ordine #{order_id} confermato per {client_name}.\n{items_txt}\nTotale: €{total:.2f}"),
+        FinalResponse(text=f"✅ Ordine #{order_id} confermato per {client_name}.\n{items_txt}\nTotale: €{total:.2f}{email_note}"),
         upd_c, upd_p,
     )
 
@@ -812,9 +863,15 @@ def impl_list_clients(query, city_filter, agent_code, known_clients, known_produ
         return _ok(FinalResponse(text=f"Cliente: {cname}{extra}{city_s}"), upd_c, upd_p)
 
     sections = _group_clients_by_city(results)
-    intro = "Ecco i tuoi clienti — per quale vuoi procedere?" if not query and not city_filter \
-            else f"Ho trovato {len(results)} clienti — per quale vuoi procedere?"
-    return _ok(FinalResponse(text=intro, use_interactive_list=True, sections=sections), upd_c, upd_p)
+    total = len(results)
+    intro = f"Ecco i tuoi {total} clienti — per quale vuoi procedere?" if not query and not city_filter \
+            else f"Ho trovato {total} clienti — per quale vuoi procedere?"
+    raw_data = [{"client_id": r.get("client_id", ""), "alias": r.get("alias", ""),
+                 "ragione_sociale": r.get("ragione_sociale", ""),
+                 "citta": r.get("citta", ""), "indirizzo": r.get("indirizzo", "")}
+                for r in results]
+    return _ok(FinalResponse(text=intro, use_interactive_list=True, sections=sections,
+                             raw_data=raw_data), upd_c, upd_p)
 
 
 def impl_search_products(query, filters, agent_code, known_clients, known_products):
@@ -836,6 +893,176 @@ def impl_search_products(query, filters, agent_code, known_clients, known_produc
         text=_product_list_text(f"Ho trovato {len(results)} prodotti per '{query}':", items),
         use_interactive_list=True, items=items,
     ), upd_c, upd_p)
+
+
+def _load_db_schema() -> str:
+    """Carica sql_lite/db_schema.yaml e genera la stringa di contesto per il prompt LLM."""
+    yaml_path = os.path.join(_project_root, "sql_lite", "db_schema.yaml")
+    with open(yaml_path, encoding="utf-8") as _f:
+        _schema = yaml.safe_load(_f)
+    lines = []
+    for tname, tdef in _schema["tables"].items():
+        lines.append(f"═══ TABELLA: {tname}  ({tdef.get('note', '')})")
+        for col, desc in tdef["columns"].items():
+            lines.append(f"  {col:<18} {desc}")
+        lines.append("")
+    lines.append("═══ JOIN PATHS")
+    for j in _schema["joins"]:
+        lines.append(f"  {j}")
+    lines.append("")
+    lines.append("═══ QUERY ESEMPIO")
+    for ex in _schema["examples"]:
+        lines.append(f"-- {ex['desc']}:")
+        lines.append(ex["sql"].rstrip())
+        lines.append("")
+    return "\n".join(lines)
+
+
+_DB_SCHEMA = _load_db_schema()   # caricato una volta all'import del modulo
+
+
+def impl_query_database(question: str, known_clients: dict, known_products: dict,
+                        agent_code: str = "",
+                        client_hint: str = None, product_hint: str = None):
+    upd_c = dict(known_clients)
+    upd_p = dict(known_products)
+    schema = _DB_SCHEMA.replace("{AGENT}", agent_code)
+
+    # Risoluzione hint: FTS5 per cliente, RAG per prodotto
+    hint_ctx = ""
+    resolved_cid = None
+
+    if client_hint:
+        cid, cinfo, cands = _resolve_client(client_hint, agent_code, upd_c)
+        if cid:
+            resolved_cid = cid
+            upd_c[cid] = cinfo or upd_c.get(cid, {})
+            hint_ctx += (
+                f"\nCLIENTE RISOLTO (usa questi valori nei filtri SQL):\n"
+                f"  client_id:       {cid}\n"
+                f"  ragione_sociale: {(cinfo or {}).get('ragione_sociale', '')}\n"
+                f"  alias:           {(cinfo or {}).get('alias', '')}\n"
+                f"  citta:           {(cinfo or {}).get('citta', '')}\n"
+                f"→ Filtra con client_id='{cid}'\n"
+            )
+            print(f"   👤 [HINT CLIENT]: {client_hint} → {cid}")
+        elif cands:
+            hint_ctx += f"\nCLIENTI TROVATI per '{client_hint}' (scegli il più pertinente):\n"
+            for c in cands[:5]:
+                hint_ctx += f"  {c['client_id']}: {c.get('ragione_sociale', '')} alias={c.get('alias', '')} città={c.get('citta', '')}\n"
+            print(f"   👤 [HINT CLIENT]: {client_hint} → {len(cands)} candidati")
+
+    if product_hint:
+        sku, pinfo, pcands = _resolve_product(product_hint, upd_p, client_id=resolved_cid)
+        if sku:
+            upd_p[sku] = pinfo or upd_p.get(sku, {})
+            hint_ctx += (
+                f"\nPRODOTTO RISOLTO (usa questi valori nei filtri SQL):\n"
+                f"  sku:         {sku}\n"
+                f"  descrizione: {(pinfo or {}).get('descrizione', '')}\n"
+                f"  brand:       {(pinfo or {}).get('brand', '')}\n"
+                f"  formato:     {(pinfo or {}).get('formato', '')}\n"
+                f"→ Filtra con sku='{sku}'\n"
+            )
+            print(f"   📦 [HINT PRODUCT]: {product_hint} → {sku}")
+        elif pcands:
+            hint_ctx += f"\nPRODOTTI TROVATI per '{product_hint}' (scegli il più pertinente):\n"
+            for p in pcands[:5]:
+                hint_ctx += f"  {p['sku']}: {p.get('descrizione', '')} ({p.get('brand', '')} {p.get('formato', '')})\n"
+            print(f"   📦 [HINT PRODUCT]: {product_hint} → {len(pcands)} candidati")
+
+    prompt = (
+        f"Sei un assistente SQL per un sistema vendite Horeca.\n\n"
+        f"Schema:\n{schema}\n\n"
+        f"{_DISCRETE_VALUES}\n\n"
+        f"Agente corrente: '{agent_code}'\n"
+        f"{hint_ctx}"
+        f"Domanda: \"{question}\"\n\n"
+        f"REGOLE:\n"
+        f"- Solo SELECT, nessuna modifica ai dati\n"
+        f"- Filtra SEMPRE per agent_id='{agent_code}' su [order], cart_item, clienti_fts\n"
+        f"- La tabella prodotti NON ha agent_id — non aggiungere filtro agente\n"
+        f"- Usa COLLATE NOCASE per confronti su stringhe\n"
+        f"- Per la tabella [order] usa SEMPRE le parentesi quadre\n"
+        f"- ORDER BY può referenziare solo colonne presenti nel SELECT o i loro alias\n"
+        f"- Evita UNION ALL: usa OR o LIKE '%termine%' per ricerche su più campi dello stesso cliente\n"
+        f"- Per cercare un cliente per nome usa LIKE '%nome%' COLLATE NOCASE su alias o ragione_sociale (non UNION)\n"
+        f"- Per filtrare su brand, categoria, sottocategoria, famiglia, formato, confezione o città, "
+        f"usa ESCLUSIVAMENTE i valori dalla sezione VALORI AMMESSI sopra\n"
+        f"- Rispondi SOLO con la query SQL, senza markdown, senza commenti"
+    )
+    _ERR_MSG = "Non riesco a formulare la query per questa richiesta. Prova a riformulare."
+    try:
+        resp = get_openai_client().chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        sql = resp.choices[0].message.content.strip().replace("```sql", "").replace("```", "").strip()
+    except Exception as e:
+        print(f"   ⚠️ [DB QUERY LLM ERROR]: {e}")
+        return _ok(FinalResponse(text=_ERR_MSG), upd_c, upd_p)
+
+    print(f"   🗃️ [DB QUERY]: {sql}")
+    if not sql.upper().startswith("SELECT"):
+        return _ok(FinalResponse(text="Query non consentita."), upd_c, upd_p)
+
+    # Tentativo 1
+    conn = sqlite3.connect(_get_db_path())
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(sql).fetchall()
+        conn.close()
+    except Exception as e1:
+        conn.close()
+        print(f"   ⚠️ [DB QUERY ERROR #1]: {e1} — retry con LLM...")
+        fix_prompt = (
+            f"Questa query SQLite ha prodotto un errore:\n\n"
+            f"Query:\n{sql}\n\n"
+            f"Errore SQLite: {e1}\n\n"
+            f"Schema:\n{schema}\n\n"
+            f"Scrivi una query corretta che risponde alla stessa domanda.\n"
+            f"REGOLE:\n"
+            f"- Solo SELECT\n"
+            f"- ORDER BY deve referenziare solo colonne nel SELECT o alias espliciti\n"
+            f"- Evita UNION ALL: usa OR o LIKE per ricerche su più campi\n"
+            f"- Per la tabella [order] usa sempre le parentesi quadre\n"
+            f"- Rispondi SOLO con la query SQL, senza markdown, senza commenti"
+        )
+        try:
+            fix_resp = get_openai_client().chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": fix_prompt}],
+                temperature=0,
+            )
+            sql = fix_resp.choices[0].message.content.strip().replace("```sql", "").replace("```", "").strip()
+            print(f"   🔄 [DB QUERY RETRY]: {sql}")
+            conn2 = sqlite3.connect(_get_db_path())
+            conn2.row_factory = sqlite3.Row
+            try:
+                rows = conn2.execute(sql).fetchall()
+                conn2.close()
+            except Exception as e2:
+                conn2.close()
+                print(f"   ❌ [DB QUERY ERROR #2]: {e2}")
+                return _ok(FinalResponse(text=_ERR_MSG), upd_c, upd_p)
+        except Exception as e_fix:
+            print(f"   ❌ [DB QUERY FIX LLM ERROR]: {e_fix}")
+            return _ok(FinalResponse(text=_ERR_MSG), upd_c, upd_p)
+
+    if not rows:
+        return _ok(FinalResponse(text=f"Nessun risultato per: {question}"), upd_c, upd_p)
+    cols = list(rows[0].keys())
+    raw = [{c: row[c] for c in cols} for row in rows[:500]]
+    if len(cols) == 1:
+        vals = [str(r[0]) for r in rows[:20]]
+        result_text = ", ".join(vals)
+    else:
+        lines = [" | ".join(f"{c}: {row[c]}" for c in cols) for row in rows[:15]]
+        result_text = "\n".join(lines)
+        if len(rows) > 15:
+            result_text += f"\n… e altri {len(rows) - 15}"
+    return _ok(FinalResponse(text=result_text, raw_data=raw), upd_c, upd_p)
 
 
 def impl_list_orders(client_ref, agent_code, known_clients, known_products):

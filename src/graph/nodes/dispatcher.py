@@ -13,9 +13,12 @@ from langgraph.types import Send
 
 from src.graph.shared import (
     AgentState,
-    ALL_TOOLS,
+    DISPATCHER_TOOLS,
     FinalResponse,
     get_model,
+    brand_values,
+    categoria_values,
+    sottocategoria_values,
 )
 
 _HISTORY_WINDOW = int(os.getenv("CHAT_HISTORY_WINDOW", "10"))
@@ -48,30 +51,47 @@ def dispatcher_node(state: AgentState) -> dict:
             f"(nome cliente, ragione sociale, numero, quantità, SKU), chiama SEMPRE e SOLO "
             f"{pc['name']} con i parametri aggiornati. "
             f"NON chiamare list_clients, search_products o altri tool.\n"
+            f"→ Se l'utente cita un numero (es. 'la 1', 'il 2'), estrai lo SKU o client_id "
+            f"corrispondente dall'ultima lista numerata in cronologia e usalo come parametro, "
+            f"NON il nome testuale dell'operazione in sospeso.\n"
             f"→ Ignora solo se l'utente cambia esplicitamente argomento "
             f"(es. 'lascia perdere', 'voglio fare altro')."
         )
     elif len(pending_calls) > 1:
+        letters = "ABCDEFGHIJ"
         lines = "\n".join(
-            f"  {i+1}. {pc['name']} — {json.dumps(pc['args'], ensure_ascii=False)}"
+            f"  {letters[i]}. {pc['name']} — {json.dumps(pc['args'], ensure_ascii=False)}"
             for i, pc in enumerate(pending_calls)
         )
         pending_ctx = (
             f"\n\n⚠️ OPERAZIONI IN SOSPESO ({len(pending_calls)}):\n{lines}\n"
             f"REGOLA CRITICA: risolvi TUTTE le operazioni in sospeso.\n"
-            f"Se l'utente fornisce selezioni multiple (es. 'la 1 ed il 4'), "
-            f"chiama un tool separato per ogni operazione, usando gli ID reali dalla lista in chat.\n"
-            f"NON chiamare list_clients, search_products o altri tool.\n"
+            f"Se l'utente cita numeri (es. 'la 1', 'il 3', 'la 1 ed il 4'), quei numeri si "
+            f"riferiscono agli elementi dell'ULTIMA LISTA NUMERATA in cronologia (prodotti o clienti), "
+            f"NON alle lettere A/B/C delle operazioni qui sopra.\n"
+            f"→ Estrai lo SKU o client_id corrispondente dalla lista in chat e usalo direttamente "
+            f"come product_ref o client_ref — NON usare il nome testuale dall'operazione in sospeso.\n"
+            f"→ Chiama un tool separato per ogni selezione dell'utente.\n"
+            f"NON chiamare list_clients, search_products o altri tool aggiuntivi.\n"
             f"→ Ignora solo se l'utente cambia esplicitamente argomento "
             f"(es. 'lascia perdere', 'voglio fare altro')."
         )
 
     is_first = len(chat_history) == 0
 
+    catalog_ctx = (
+        f"\nCATALOGO — FILTRI DISPONIBILI PER search_products:\n"
+        f"  Brand:          {', '.join(brand_values)}\n"
+        f"  Categorie:      {', '.join(categoria_values)}\n"
+        f"  Sottocategorie: {', '.join(sottocategoria_values)}\n"
+        f"Usa questi valori esatti in filters_json quando l'utente filtra per brand o categoria.\n"
+    )
+
     system_prompt = (
         f"Sei l'assistente vendite Horeca per {agent_nome or agent_code}.\n"
         f"Data e ora: {state.get('current_datetime') or ''}\n\n"
         f"CLIENTI RISOLTI IN SESSIONE:\n{clients_str}"
+        f"{catalog_ctx}"
         f"{pending_ctx}\n\n"
         f"ISTRUZIONI:\n"
         f"- Chiama lo strumento appropriato in base al messaggio.\n"
@@ -91,13 +111,25 @@ def dispatcher_node(state: AgentState) -> dict:
         f"(client_id tipo C022, o SKU tipo BIR-HEI-CLA-33V) come parametro, NON il numero grezzo.\n"
         f"- Se nella cronologia vedi già client_id o SKU espliciti relativi alla richiesta corrente, "
         f"usali direttamente senza chiedere conferma.\n"
-        f"- Per richieste informative sul catalogo (prezzi, disponibilità, brand) usa search_products.\n"
+        f"- Per ricerca semantica di un prodotto specifico (es. 'trovami una birra leggera', 'Ichnusa non filtrata') usa search_products.\n"
+        f"- Per domande su dati del database usa SEMPRE query_database — anche per elenchi, filtri, aggregazioni:\n"
+        f"  'quali brand di birra?', 'prodotti sotto €2', 'quante birre abbiamo?',\n"
+        f"  'clienti di Milano', 'totale ordini per cliente', 'prodotti disponibili > 100',\n"
+        f"  'ordini di Bar Mario', 'quante Ichnusa ha ordinato Bar Mario questa settimana',\n"
+        f"  'brand di succhi', 'birre in lattina', 'formati disponibili per Heineken'.\n"
+        f"  → Se la domanda menziona un cliente specifico, popola client_hint con il nome del cliente.\n"
+        f"  → Se la domanda menziona un prodotto specifico, popola product_hint con il nome del prodotto.\n"
+        f"  Esempi: 'ordini di Bar Mario' → client_hint='Bar Mario';\n"
+        f"          'quante Ichnusa ha ordinato Bar Mario' → client_hint='Bar Mario', product_hint='Ichnusa'.\n"
+        f"- Usa free_response SOLO per: primo saluto, risposte fuori ambito, o quando i dati della "
+        f"sezione CATALOGO sopra bastano a rispondere COMPLETAMENTE senza filtri (es. 'elenca tutte le categorie').\n"
+        f"  Se c'è un filtro ('brand DI BIRRA', 'clienti DI MILANO') usa SEMPRE query_database.\n"
         f"- Per il primo messaggio usa free_response con un breve benvenuto a "
         f"{agent_nome or agent_code}.\n"
         f"- Per richieste fuori ambito usa free_response."
     )
 
-    llm = get_model("generic").bind_tools(ALL_TOOLS)
+    llm = get_model("generic").bind_tools(DISPATCHER_TOOLS)
     messages = (
         [SystemMessage(content=system_prompt)]
         + chat_history[-_HISTORY_WINDOW:]

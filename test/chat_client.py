@@ -41,28 +41,28 @@ def send_message(base_url: str, sender_id: str, text: str) -> dict:
 def reset_session(base_url: str, sender_id: str) -> None:
     try:
         r = requests.delete(
-            f"{base_url}/test/chat",
+            f"{base_url}/test/reset_chat",
             json={"sender_id": sender_id},
             timeout=10,
         )
         r.raise_for_status()
-        print("🔄  Sessione resettata.\n")
+        print("🔄  Chat resettata.\n")
     except Exception as e:
-        print(f"❌  Errore reset: {e}\n")
+        print(f"❌  Errore reset chat: {e}\n")
 
 
 def reset_all(base_url: str) -> None:
-    """Chiama /admin/reset: ricrea DB ordini e svuota tutti i checkpoint."""
+    """Chiama /admin/reset_db: ricrea DB ordini e svuota tutti i checkpoint."""
     try:
-        r = requests.post(f"{base_url}/admin/reset", timeout=30)
+        r = requests.post(f"{base_url}/admin/reset_db", timeout=30)
         r.raise_for_status()
         data = r.json()
         print(
-            f"🔄  Reset completo — clienti caricati: {data.get('clienti_caricati')}, "
+            f"🔄  Reset DB completo — "
             f"DB ordini: {data.get('db_ordini')}, checkpoint: {data.get('checkpoints')}\n"
         )
     except Exception as e:
-        print(f"❌  Errore reset completo: {e}\n")
+        print(f"❌  Errore reset DB: {e}\n")
 
 
 def print_response(resp: dict, last_list: list) -> list:
