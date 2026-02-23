@@ -47,28 +47,32 @@ def merge_node(state: AgentState) -> dict:
     non_empty     = [r for r in responses if r.text.strip()]
     lists         = [r for r in responses if r.sections or r.items]
 
-    if not has_cart_view and len(responses) == 1:
-        final = responses[0]
-    elif not has_cart_view and len(lists) > 1:
+    if len(lists) > 1:
         # Sequenziale: mostra solo la PRIMA disambiguazione.
         # Le altre restano come pending_call e verranno riproposte al turno successivo.
         first = lists[0]
         final = FinalResponse(
-            text=first.text,
+            text=first.text + "\n\n_Seguirà un'altra selezione._",
             use_interactive_list=True,
             sections=first.sections or [],
             items=first.items or [],
         )
+    elif len(responses) == 1 and not has_cart_view:
+        final = responses[0]
     else:
         last_list     = lists[-1] if lists else None
         combined_text = "\n\n".join(r.text for r in non_empty)
-        # Mantieni lista interattiva solo se non ci sono cart view in arrivo
         final = FinalResponse(
             text=combined_text,
-            use_interactive_list=bool(last_list and not has_cart_view),
-            items=last_list.items    if last_list and not has_cart_view else [],
-            sections=last_list.sections if last_list and not has_cart_view else [],
+            use_interactive_list=bool(last_list),
+            items=last_list.items    if last_list else [],
+            sections=last_list.sections if last_list else [],
         )
+
+    # Nota UX: se ci sono più pending che liste mostrate, avvisa l'utente
+    if isinstance(new_pending, list) and len(new_pending) > 1 and final.use_interactive_list:
+        if "_Seguirà un'altra selezione._" not in final.text:
+            final.text = final.text.rstrip() + "\n\n_Seguirà un'altra selezione._"
 
     # --- Cart view post-mutation ---
     # Raccoglie client_id unici che hanno avuto una mutation (add/remove)
@@ -89,9 +93,16 @@ def merge_node(state: AgentState) -> dict:
             cart_parts.append(f"{cart_text}{suffix}")
 
         cart_section = "\n\n".join(cart_parts)
-        # Prependi eventuale testo non-cart (es. search_products + add_to_cart)
         combined = f"{final.text}\n\n{cart_section}".strip() if final.text.strip() else cart_section
-        final = FinalResponse(text=combined)
+        # Preserva proprietà lista interattiva (pallino al secondo giro di disambiguazione)
+        final = FinalResponse(
+            text=combined,
+            use_interactive_list=final.use_interactive_list,
+            sections=final.sections,
+            items=final.items,
+            raw_data=final.raw_data,
+            overflow=final.overflow,
+        )
 
     print(f"   📤 Risposta: {final.text[:100]}")
     if final.use_interactive_list:

@@ -407,13 +407,25 @@ def send_whatsapp_message(to: str, content, agent_code: str = ""):
         }
     else:
         text_body = content.text if hasattr(content, 'text') else str(content)
+        _overflow_sent = False
+
+        # Flag overflow: invia email con dati completi indipendentemente dalla lunghezza
+        if getattr(content, "overflow", False) and getattr(content, "raw_data", None):
+            subject = (content.text or "Risultato query")[:50].replace("\n", " ")
+            send_overflow_email(
+                agent_code, f"Risultato completo: {subject}",
+                content.text, content.raw_data,
+            )
+            _overflow_sent = True
+
         if len(text_body) > _WA_BODY_TEXT:
             full_text = text_body
             text_body = text_body[:_WA_BODY_TEXT - 40] + "…\n📧 Risultato completo inviato via email."
-            send_overflow_email(
-                agent_code, "Risultato completo", full_text,
-                getattr(content, "raw_data", None)
-            )
+            if not _overflow_sent:
+                send_overflow_email(
+                    agent_code, "Risultato completo", full_text,
+                    getattr(content, "raw_data", None)
+                )
         elif len(text_body) > 4000:
             text_body = text_body[:3997] + "..."
         payload = {

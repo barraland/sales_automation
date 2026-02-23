@@ -136,6 +136,7 @@ class FinalResponse(BaseModel):
     items: List[WhatsAppListItem] = []
     sections: List[WhatsAppSection] = []
     raw_data: Optional[List[Dict[str, Any]]] = None  # per allegato email overflow
+    overflow: bool = False  # risultato troncato, invia email con dati completi
 
 
 # =============================================================================
@@ -931,6 +932,7 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
     # Risoluzione hint: FTS5 per cliente, RAG per prodotto
     hint_ctx = ""
     resolved_cid = None
+    resolved_codes: list[str] = []  # codici risolti da mostrare all'utente
 
     if client_hint:
         cid, cinfo, cands = _resolve_client(client_hint, agent_code, upd_c)
@@ -945,11 +947,13 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
                 f"  citta:           {(cinfo or {}).get('citta', '')}\n"
                 f"→ Filtra con client_id='{cid}'\n"
             )
+            resolved_codes.append(f"Cliente: {cid}")
             print(f"   👤 [HINT CLIENT]: {client_hint} → {cid}")
         elif cands:
             hint_ctx += f"\nCLIENTI TROVATI per '{client_hint}' (scegli il più pertinente):\n"
             for c in cands[:5]:
                 hint_ctx += f"  {c['client_id']}: {c.get('ragione_sociale', '')} alias={c.get('alias', '')} città={c.get('citta', '')}\n"
+            resolved_codes.append(f"Clienti: {', '.join(c['client_id'] for c in cands[:5])}")
             print(f"   👤 [HINT CLIENT]: {client_hint} → {len(cands)} candidati")
 
     if product_hint:
@@ -964,11 +968,13 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
                 f"  formato:     {(pinfo or {}).get('formato', '')}\n"
                 f"→ Filtra con sku='{sku}'\n"
             )
+            resolved_codes.append(f"Prodotto: {sku}")
             print(f"   📦 [HINT PRODUCT]: {product_hint} → {sku}")
         elif pcands:
             hint_ctx += f"\nPRODOTTI TROVATI per '{product_hint}' (scegli il più pertinente):\n"
             for p in pcands[:5]:
                 hint_ctx += f"  {p['sku']}: {p.get('descrizione', '')} ({p.get('brand', '')} {p.get('formato', '')})\n"
+            resolved_codes.append(f"Prodotti: {', '.join(p['sku'] for p in pcands[:5])}")
             print(f"   📦 [HINT PRODUCT]: {product_hint} → {len(pcands)} candidati")
 
     prompt = (
@@ -1054,15 +1060,32 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
         return _ok(FinalResponse(text=f"Nessun risultato per: {question}"), upd_c, upd_p)
     cols = list(rows[0].keys())
     raw = [{c: row[c] for c in cols} for row in rows[:500]]
+
+    _SINGLE_LIMIT, _MULTI_LIMIT = 20, 15
+    is_overflow = False
+
     if len(cols) == 1:
-        vals = [str(r[0]) for r in rows[:20]]
+        vals = [str(r[0]) for r in rows[:_SINGLE_LIMIT]]
         result_text = ", ".join(vals)
+        if len(rows) > _SINGLE_LIMIT:
+            is_overflow = True
     else:
-        lines = [" | ".join(f"{c}: {row[c]}" for c in cols) for row in rows[:15]]
+        lines = [" | ".join(f"{c}: {row[c]}" for c in cols) for row in rows[:_MULTI_LIMIT]]
         result_text = "\n".join(lines)
-        if len(rows) > 15:
-            result_text += f"\n… e altri {len(rows) - 15}"
-    return _ok(FinalResponse(text=result_text, raw_data=raw), upd_c, upd_p)
+        if len(rows) > _MULTI_LIMIT:
+            is_overflow = True
+
+    if is_overflow:
+        shown = _SINGLE_LIMIT if len(cols) == 1 else _MULTI_LIMIT
+        result_text += (
+            f"\n\n_Risultato parziale ({shown} di {len(rows)}). "
+            f"Il risultato completo ti verrà inviato via email._"
+        )
+
+    if resolved_codes:
+        result_text = "_Codici utilizzati: " + " | ".join(resolved_codes) + "_\n\n" + result_text
+
+    return _ok(FinalResponse(text=result_text, raw_data=raw, overflow=is_overflow), upd_c, upd_p)
 
 
 def impl_list_orders(client_ref, agent_code, known_clients, known_products):
