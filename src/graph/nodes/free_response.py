@@ -11,7 +11,7 @@ def free_response_node(state: AgentState) -> dict:
     return {
         "tool_results": [{
             "name":         "free_response",
-            "response":     FinalResponse(text=text).dict(),
+            "response":     FinalResponse(text=text).model_dump(),
             "needs_input":  False,
             "pending_call": None,
             "upd_clients":    state.get("known_clients") or {},

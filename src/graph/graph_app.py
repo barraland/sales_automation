@@ -5,7 +5,7 @@ Architettura fan-out con Send:
   dispatcher_node
       ↓ route_to_tools (Send per ogni tool call)
   [add_to_cart | remove_from_cart | clear_cart | view_cart |
-   confirm_order | list_clients | search_products | query_database | list_orders | free_response]
+   confirm_order | list_clients | search_products | query_database | list_orders | free_response | remember]
       ↓ (tutti → merge)
   merge_node
       ↓
@@ -39,6 +39,7 @@ from src.graph.nodes.search_products import search_products_node
 from src.graph.nodes.list_orders      import list_orders_node
 from src.graph.nodes.query_database   import query_database_node
 from src.graph.nodes.free_response    import free_response_node
+from src.graph.nodes.remember        import remember_node
 from src.graph.nodes.merge          import merge_node
 
 
@@ -53,6 +54,7 @@ _TOOL_NODES = {
     "query_database":   query_database_node,
     "list_orders":      list_orders_node,
     "free_response":    free_response_node,
+    "remember":         remember_node,
 }
 
 

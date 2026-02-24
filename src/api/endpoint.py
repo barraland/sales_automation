@@ -16,6 +16,57 @@ from src.graph.graph_app import create_graph, agent_name_map
 app = FastAPI(title="Beverage Agent API")
 beverage_agent = create_graph()
 
+
+# =============================================================================
+# AUTO-INIT WEAVIATE (crea collection + carica clienti se vuota)
+# =============================================================================
+def _init_weaviate():
+    """Se la collection Clienti non esiste o è vuota, la crea e carica da clienti.csv."""
+    import time
+    MAX_ATTEMPTS = 5
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            from src.tools.weaviate_client import get_weaviate_client, COLLECTION_NAME
+            client = get_weaviate_client()
+
+            needs_load = False
+            if not client.collections.exists(COLLECTION_NAME):
+                print(f"📦 [WEAVIATE INIT] Collection '{COLLECTION_NAME}' non esiste — creo...")
+                needs_load = True
+            else:
+                col = client.collections.get(COLLECTION_NAME)
+                count = col.aggregate.over_all(total_count=True).total_count
+                if count == 0:
+                    print(f"📦 [WEAVIATE INIT] Collection '{COLLECTION_NAME}' vuota — ricarico...")
+                    needs_load = True
+                else:
+                    print(f"✅ [WEAVIATE INIT] Collection '{COLLECTION_NAME}' ok ({count} clienti)")
+                    return
+
+            if needs_load:
+                # Importa setup functions
+                import sys
+                sys.path.insert(0, _project_root)
+                from scripts.weaviate.weaviate_setup import reset_collection
+                reset_collection()
+                print("✅ [WEAVIATE INIT] Dati caricati")
+            return
+
+        except Exception as e:
+            wait = 2 ** (attempt + 1)
+            print(f"⚠️ [WEAVIATE INIT] Tentativo {attempt+1}/{MAX_ATTEMPTS} fallito: {e}")
+            if attempt < MAX_ATTEMPTS - 1:
+                print(f"   Riprovo tra {wait}s...")
+                time.sleep(wait)
+            else:
+                print("❌ [WEAVIATE INIT] Impossibile inizializzare Weaviate — continuo senza")
+
+
+@app.on_event("startup")
+async def startup_weaviate():
+    import threading
+    threading.Thread(target=_init_weaviate, daemon=True).start()
+
 # --- CONFIGURAZIONE ---
 TOKEN = "EAAedUO2ZA8XQBQvvBXZBWRjwQUMBZBLsb0h0XRzkZCC424oucLXWfAI7AmG0w1dFx91rZCsVBMt0tr7x5i9MyNsOjaGo4nsO2sEPUO4Vr3l4KLr9Uwusur56Un17OJDrFYSjsojqvhRtVmLbevuJbEU9zzZAF445ZCNUnLhfLGlwZAMR56hO06j2l4VZAIkM2XQZDZD"
 PHONE_NUMBER_ID = "1043497188838302"
@@ -526,7 +577,7 @@ async def test_reset_chat(request: Request):
     default_sender = next(iter(AGENT_MAPPING))
     sender_id = body.get("sender_id", default_sender)
     config = {"configurable": {"thread_id": sender_id}}
-    beverage_agent.update_state(config, {"chat_history": [], "pending_call": None, "final_answer": None})
+    beverage_agent.update_state(config, {"chat_history": [], "pending_call": None, "final_answer": None, "session_memory": []})
     print(f"🔄 RESET CHAT per {sender_id}")
     return {"reset": True, "sender_id": sender_id}
 

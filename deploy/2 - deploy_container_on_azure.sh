@@ -22,6 +22,9 @@ ENV_NAME="btn-env"
 
 APP_NAME="sales-automation-container"
 
+WEAVIATE_APP_NAME="weaviate"
+WEAVIATE_IMAGE="cr.weaviate.io/semitechnologies/weaviate:1.28.4"
+
 ACR_NAME="betterthannuviaacr123456"
 IMAGE_REPO="sales_automation-image"
 IMAGE_TAG="${IMAGE_TAG:-v1}"
@@ -190,6 +193,94 @@ if ! az containerapp env show -g "$RG" -n "$ENV_NAME" >/dev/null 2>&1; then
 fi
 
 # ----------------------------
+# Deploy Weaviate (immagine pubblica)
+# - Ingress INTERNO (l'app popola Weaviate allo startup automaticamente)
+# - gRPC porta 50051 via additionalPortMappings
+# ----------------------------
+WEAVIATE_ENV_VARS=(
+  "QUERY_DEFAULTS_LIMIT=25"
+  "AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true"
+  "PERSISTENCE_DATA_PATH=/var/lib/weaviate"
+  "DEFAULT_VECTORIZER_MODULE=text2vec-openai"
+  "ENABLE_MODULES=text2vec-openai"
+  "CLUSTER_HOSTNAME=node1"
+  "OPENAI_APIKEY=$OPENAI_API_KEY"
+)
+
+echo "🔷 Deploy Weaviate..."
+if ! az containerapp show -g "$RG" -n "$WEAVIATE_APP_NAME" >/dev/null 2>&1; then
+  echo "🆕 Creo container Weaviate (ingress internal, porta 8080)..."
+  az containerapp create \
+    -g "$RG" \
+    -n "$WEAVIATE_APP_NAME" \
+    --environment "$ENV_NAME" \
+    --image "$WEAVIATE_IMAGE" \
+    --ingress internal \
+    --target-port 8080 \
+    --min-replicas 1 \
+    --max-replicas 1 \
+    --cpu 1.0 --memory 2.0Gi \
+    --env-vars "${WEAVIATE_ENV_VARS[@]}" \
+    --no-wait >/dev/null
+
+  if ! wait_provisioning "$WEAVIATE_APP_NAME" 900 5; then
+    dump_diagnostics "$WEAVIATE_APP_NAME"
+    die "Provisioning Weaviate fallito"
+  fi
+  echo "✅ Weaviate creato (ingress interno)"
+else
+  echo "♻️ Weaviate esiste, aggiorno immagine + env vars..."
+  az containerapp update -g "$RG" -n "$WEAVIATE_APP_NAME" \
+    --image "$WEAVIATE_IMAGE" \
+    --set-env-vars "${WEAVIATE_ENV_VARS[@]}" \
+    --no-wait >/dev/null
+
+  if ! wait_provisioning "$WEAVIATE_APP_NAME" 900 5; then
+    dump_diagnostics "$WEAVIATE_APP_NAME"
+    die "Provisioning Weaviate fallito durante update"
+  fi
+  echo "✅ Weaviate aggiornato"
+fi
+
+# Configura ingress interno + porta gRPC 50051
+echo "🔒 Configuro Weaviate: ingress interno + porta gRPC 50051..."
+WEAVIATE_ID="$(az containerapp show -g "$RG" -n "$WEAVIATE_APP_NAME" --query id -o tsv)"
+echo "  Weaviate ID: $WEAVIATE_ID"
+
+if ! az rest --method patch --url "${WEAVIATE_ID}?api-version=2024-03-01" --body '{
+  "properties": {
+    "configuration": {
+      "ingress": {
+        "external": false,
+        "targetPort": 8080,
+        "transport": "Auto",
+        "additionalPortMappings": [
+          {
+            "external": false,
+            "targetPort": 50051,
+            "exposedPort": 50051
+          }
+        ]
+      }
+    }
+  }
+}'; then
+  echo "⚠️ az rest patch fallito — provo con ingress CLI (senza gRPC)..."
+  az containerapp ingress enable -g "$RG" -n "$WEAVIATE_APP_NAME" \
+    --type internal --target-port 8080 --transport auto || true
+fi
+
+if ! wait_provisioning "$WEAVIATE_APP_NAME" 300 5; then
+  echo "⚠️ Weaviate provisioning post-patch non completato (può essere ok)"
+fi
+
+# Verifica configurazione ingress finale
+echo "🔍 Verifica ingress Weaviate:"
+az containerapp show -g "$RG" -n "$WEAVIATE_APP_NAME" \
+  --query '{external: properties.configuration.ingress.external, targetPort: properties.configuration.ingress.targetPort, additionalPorts: properties.configuration.ingress.additionalPortMappings}' \
+  -o json 2>/dev/null || true
+
+# ----------------------------
 # ACR info + sanity checks
 # ----------------------------
 ACR_SERVER="$(az acr show -n "$ACR_NAME" --resource-group "$ACR_RG" --query loginServer -o tsv)"
@@ -302,6 +393,10 @@ UPDATE_ENV_VARS=(
   "GEMINI_MODEL_PLANNER=$GEMINI_MODEL_PLANNER"
   "GEMINI_MODEL_GENERIC=$GEMINI_MODEL_GENERIC"
 
+  "WEAVIATE_URL=http://weaviate:80"
+  "WEAVIATE_GRPC_PORT=50051"
+  "WEAVIATE_SKIP_INIT=true"
+
   "DEPLOY_TS=$DEPLOY_TS"
 )
 [[ -n "$GEMINI_API_KEY" ]] && UPDATE_ENV_VARS+=("GEMINI_API_KEY=secretref:gemini-api-key")
@@ -320,14 +415,19 @@ CUR_REV="$(az containerapp show -g "$RG" -n "$APP_NAME" --query properties.lates
 FQDN="$(az containerapp show -g "$RG" -n "$APP_NAME" --query properties.configuration.ingress.fqdn -o tsv)"
 
 echo
+# NB: Weaviate viene popolato automaticamente dall'app allo startup
+#     (vedi _init_weaviate in endpoint.py)
+
 echo "✅ DEPLOY COMPLETATO"
-echo "APP:     $APP_NAME"
-echo "IMG:     $CUR_IMAGE"
-echo "REV:     $CUR_REV"
-echo "URL:     https://$FQDN"
+echo "APP:       $APP_NAME"
+echo "IMG:       $CUR_IMAGE"
+echo "REV:       $CUR_REV"
+echo "URL:       https://$FQDN"
+echo "WEAVIATE:  $WEAVIATE_APP_NAME (internal, HTTP :80 + gRPC :50051)"
 echo
 echo "Webhook WhatsApp da configurare su Meta:"
 echo "  https://$FQDN/whatsapp"
 echo
 echo "Logs:"
 echo "  az containerapp logs show -g $RG -n $APP_NAME --follow"
+echo "  az containerapp logs show -g $RG -n $WEAVIATE_APP_NAME --follow"

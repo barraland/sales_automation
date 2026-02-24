@@ -64,6 +64,25 @@ sottocategoria_values = facets.get("sottocategoria", [])
 
 
 # =============================================================================
+# CITTÀ DISTINTE DALL'ANAGRAFICA CLIENTI (Weaviate, caricati all'avvio)
+# =============================================================================
+def _load_city_values() -> list:
+    try:
+        from src.tools.weaviate_client import get_collection
+        collection = get_collection()
+        resp = collection.query.fetch_objects(limit=500)
+        return sorted({
+            o.properties.get("citta", "")
+            for o in resp.objects
+            if o.properties.get("citta")
+        })
+    except Exception:
+        return []
+
+citta_values = _load_city_values()
+
+
+# =============================================================================
 # VALORI DISCRETI PER TEXT-TO-SQL (caricati da SQLite all'avvio)
 # =============================================================================
 def _load_discrete_values() -> str:
@@ -148,28 +167,33 @@ class add_to_cart(BaseModel):
     client_ref:  str           = Field(description="Nome, alias, ragione sociale o client_id (es. C036) del cliente")
     product_ref: str           = Field(description="Nome, brand, descrizione o SKU del prodotto (es. BIR-ICH-NON-33V)")
     quantity:    Optional[int] = Field(None, description="Quantità richiesta. Lascia null se l'utente non l'ha specificata.")
+    city_hint:   Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class remove_from_cart(BaseModel):
     """Rimuove un prodotto dal carrello di un cliente."""
-    client_ref:  str = Field(description="Nome, alias o client_id del cliente")
-    product_ref: str = Field(description="Nome, brand, descrizione o SKU del prodotto")
+    client_ref:  str           = Field(description="Nome, alias o client_id del cliente")
+    product_ref: str           = Field(description="Nome, brand, descrizione o SKU del prodotto")
+    city_hint:   Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class clear_cart(BaseModel):
     """Svuota completamente il carrello di un cliente."""
-    client_ref: str = Field(description="Nome, alias o client_id del cliente")
+    client_ref: str           = Field(description="Nome, alias o client_id del cliente")
+    city_hint:  Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class view_cart(BaseModel):
     """Mostra il carrello corrente di un cliente."""
-    client_ref: str = Field(description="Nome, alias o client_id del cliente")
+    client_ref: str           = Field(description="Nome, alias o client_id del cliente")
+    city_hint:  Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class confirm_order(BaseModel):
     """Conferma e invia l'ordine per un cliente.
     Usare SOLO quando l'utente conferma esplicitamente: 'sì', 'confermo', 'invia', 'procedi', 'manda'."""
-    client_ref: str = Field(description="Nome, alias o client_id del cliente")
+    client_ref: str           = Field(description="Nome, alias o client_id del cliente")
+    city_hint:  Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class list_clients(BaseModel):
@@ -192,6 +216,7 @@ class search_products(BaseModel):
 class list_orders(BaseModel):
     """Mostra gli ordini passati dell'agente, opzionalmente filtrati per cliente."""
     client_ref: Optional[str] = Field(None, description="Nome o client_id del cliente. None per tutti gli ordini.")
+    city_hint:  Optional[str] = Field(None, description="Città del cliente, se menzionata (es. 'Torino'). Aiuta a disambiguare omonimi.")
 
 
 class query_database(BaseModel):
@@ -211,9 +236,16 @@ class free_response(BaseModel):
     text: str = Field(description="Testo della risposta in italiano, conciso (max 3 righe)")
 
 
+class remember(BaseModel):
+    """Memorizza un alias, preferenza o modo di dire dell'utente per il resto della sessione.
+    Chiamalo quando l'utente corregge un nome, specifica un alias, o indica una preferenza ricorrente."""
+    fact: str = Field(description="Fatto da ricordare, conciso e strutturato (es. 'Marione = Mario Rossi di Milano (C001)', 'Ichnusa = sempre la Non Filtrata 33cl BIR-ICH-NON-33V')")
+
+
 ALL_TOOLS = [
     add_to_cart, remove_from_cart, clear_cart, view_cart, confirm_order,
     list_clients, search_products, query_database, list_orders, free_response,
+    remember,
 ]
 
 # Tool esposti all'LLM nel dispatcher — list_orders è nascosto (usa query_database)
@@ -250,6 +282,7 @@ class AgentState(TypedDict, total=False):
     tool_calls:          List[Dict[str, Any]]    # tool calls dal dispatcher LLM
     tool_results:        Annotated[List[Dict[str, Any]], _results_reducer]
     current_tool_call:   Optional[Dict[str, Any]]  # impostato da Send per ogni branch
+    session_memory:      List[str]                  # fatti/alias appresi durante la sessione
 
 
 # =============================================================================
@@ -534,7 +567,7 @@ def _is_sku(ref: str) -> bool:
     return bool(re.match(r"^[A-Z]{2,}-[A-Z0-9-]+$", ref.strip()))
 
 
-def _resolve_client(client_ref: str, agent_code: str, known_clients: dict):
+def _resolve_client(client_ref: str, agent_code: str, known_clients: dict, city_hint: str = None):
     """
     Risolve un riferimento cliente in (client_id, info_dict, candidates).
     - Risolto:     (client_id, info, None)
@@ -548,21 +581,42 @@ def _resolve_client(client_ref: str, agent_code: str, known_clients: dict):
         if not info:
             rows = search_client_smart(agent_code, client_id=ref)
             info = dict(rows[0]) if rows else {}
+        print(f"   🔍 [RESOLVE CLIENT] '{ref}' → direct ID → {ref}")
         return ref, info, None
 
     # Exact match su known_clients
     for cid, info in known_clients.items():
         if (info.get("ragione_sociale") or "").lower() == ref.lower():
+            print(f"   🔍 [RESOLVE CLIENT] '{ref}' → exact match known → {cid}")
             return cid, info, None
         if (info.get("alias") or "").lower() == ref.lower():
+            print(f"   🔍 [RESOLVE CLIENT] '{ref}' → exact match known → {cid}")
             return cid, info, None
 
-    # FTS5 search
-    results = [dict(r) for r in search_client_smart(agent_code, query_text=ref)]
+    # Weaviate hybrid search — city_hint restringe i risultati
+    results = [dict(r) for r in search_client_smart(
+        agent_code, query_text=ref, city_filter=city_hint or None
+    )]
     if not results:
+        print(f"   🔍 [RESOLVE CLIENT] '{ref}' city_hint={city_hint} → 0 risultati")
         return None, None, []
+
+    top = results[0]
+    print(f"   🔍 [RESOLVE CLIENT] '{ref}' city_hint={city_hint} → {len(results)} risultati, "
+          f"top={top.get('alias')} ({top['client_id']}) score={top.get('score', '?')}")
+
     if len(results) == 1:
-        return results[0]["client_id"], results[0], None
+        return top["client_id"], top, None
+
+    # Auto-select se il primo risultato ha score molto superiore al secondo
+    top_score = top.get("score", 0)
+    second_score = results[1].get("score", 0)
+    if top_score >= 0.85 and (top_score - second_score) >= 0.2:
+        print(f"   ✅ [AUTO-SELECT] {top['client_id']} — {top.get('alias')} "
+              f"(gap: {top_score - second_score:.2f})")
+        return top["client_id"], top, None
+
+    print(f"   ❓ [DISAMBIGUA] {len(results)} candidati — score gap insufficiente")
     return None, None, results
 
 
@@ -646,11 +700,11 @@ def _ok(resp: FinalResponse, upd_c: dict, upd_p: dict, cart_client_id: Optional[
     return resp, False, None, upd_c, upd_p, cart_client_id
 
 
-def impl_add_to_cart(client_ref, product_ref, quantity, agent_code, known_clients, known_products):
+def impl_add_to_cart(client_ref, product_ref, quantity, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
-    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c)
+    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
     if client_id is None:
         if not client_cands:
             return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)
@@ -704,11 +758,11 @@ def impl_add_to_cart(client_ref, product_ref, quantity, agent_code, known_client
     return _ok(FinalResponse(text=""), upd_c, upd_p, cart_client_id=client_id)
 
 
-def impl_remove_from_cart(client_ref, product_ref, agent_code, known_clients, known_products):
+def impl_remove_from_cart(client_ref, product_ref, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
-    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c)
+    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
     if client_id is None:
         if not client_cands:
             return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)
@@ -743,11 +797,11 @@ def impl_remove_from_cart(client_ref, product_ref, agent_code, known_clients, kn
     return _ok(FinalResponse(text=""), upd_c, upd_p, cart_client_id=client_id)
 
 
-def impl_clear_cart(client_ref, agent_code, known_clients, known_products):
+def impl_clear_cart(client_ref, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
-    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c)
+    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
     if client_id is None:
         if not client_cands:
             return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)
@@ -767,11 +821,11 @@ def impl_clear_cart(client_ref, agent_code, known_clients, known_products):
     return _ok(FinalResponse(text=f"Carrello di {client_name} svuotato."), upd_c, upd_p)
 
 
-def impl_view_cart(client_ref, agent_code, known_clients, known_products):
+def impl_view_cart(client_ref, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
-    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c)
+    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
     if client_id is None:
         if not client_cands:
             return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)
@@ -793,11 +847,11 @@ def impl_view_cart(client_ref, agent_code, known_clients, known_products):
     return _ok(FinalResponse(text=f"{cart_text}{suffix}"), upd_c, upd_p)
 
 
-def impl_confirm_order(client_ref, agent_code, known_clients, known_products):
+def impl_confirm_order(client_ref, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
-    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c)
+    client_id, client_info, client_cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
     if client_id is None:
         if not client_cands:
             return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)
@@ -1069,9 +1123,23 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
         result_text = ", ".join(vals)
         if len(rows) > _SINGLE_LIMIT:
             is_overflow = True
-    else:
-        lines = [" | ".join(f"{c}: {row[c]}" for c in cols) for row in rows[:_MULTI_LIMIT]]
+    elif len(cols) == 2:
+        # Due colonne: formato compatto "chiave: valore" su una riga
+        lines = [f"• {rows[i][cols[0]]} — {rows[i][cols[1]]}" for i in range(min(len(rows), _MULTI_LIMIT))]
         result_text = "\n".join(lines)
+        if len(rows) > _MULTI_LIMIT:
+            is_overflow = True
+    else:
+        # Multi-colonna: blocchi numerati, una proprietà per riga
+        blocks = []
+        for i, row in enumerate(rows[:_MULTI_LIMIT], 1):
+            block_lines = [f"*{i}.* {cols[0]}: {row[cols[0]]}"]
+            for c in cols[1:]:
+                val = row[c]
+                if val is not None and str(val).strip():
+                    block_lines.append(f"    {c}: {val}")
+            blocks.append("\n".join(block_lines))
+        result_text = "\n\n".join(blocks)
         if len(rows) > _MULTI_LIMIT:
             is_overflow = True
 
@@ -1088,14 +1156,14 @@ def impl_query_database(question: str, known_clients: dict, known_products: dict
     return _ok(FinalResponse(text=result_text, raw_data=raw, overflow=is_overflow), upd_c, upd_p)
 
 
-def impl_list_orders(client_ref, agent_code, known_clients, known_products):
+def impl_list_orders(client_ref, agent_code, known_clients, known_products, city_hint=None):
     upd_c = dict(known_clients)
     upd_p = dict(known_products)
 
     client_id   = None
     client_name = None
     if client_ref:
-        cid, cinfo, cands = _resolve_client(client_ref, agent_code, upd_c)
+        cid, cinfo, cands = _resolve_client(client_ref, agent_code, upd_c, city_hint=city_hint)
         if cid is None:
             if not cands:
                 return _ok(FinalResponse(text=f"Nessun cliente trovato per '{client_ref}'."), upd_c, upd_p)

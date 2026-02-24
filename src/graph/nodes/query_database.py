@@ -19,7 +19,7 @@ def query_database_node(state: AgentState) -> dict:
     return {
         "tool_results": [{
             "name":           "query_database",
-            "response":       resp.dict(),
+            "response":       resp.model_dump(),
             "needs_input":    needs_input,
             "pending_call":   pending_call,
             "upd_clients":    upd_c,

@@ -1,0 +1,12 @@
+# 1. Crea la collection (schema + vectorizer)
+python scripts/weaviate_setup.py create
+
+# 2. Carica clienti da data/clienti.csv
+python scripts/weaviate_setup.py load
+
+# Oppure tutto insieme (delete + create + load):
+python scripts/weaviate_setup.py reset
+Per verificare:
+
+
+python scripts/weaviate_setup.py count    # → "115 oggetti"

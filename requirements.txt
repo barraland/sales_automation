@@ -26,6 +26,9 @@ langgraph-checkpoint>=3.0.0
 langgraph-checkpoint-sqlite>=3.0.0
 aiosqlite==0.22.1
 
+# --- WEAVIATE ---
+weaviate-client>=4.9.0
+
 # --- UTILS ---
 python-multipart==0.0.9
 SQLAlchemy==2.0.36

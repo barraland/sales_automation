@@ -26,9 +26,13 @@ def merge_node(state: AgentState) -> dict:
     # Aggrega known_clients e known_products da tutti i branch
     merged_clients  = dict(state.get("known_clients") or {})
     merged_products = dict(state.get("known_products") or {})
+    merged_memory   = list(state.get("session_memory") or [])
     for r in results:
         merged_clients.update(r.get("upd_clients") or {})
         merged_products.update(r.get("upd_products") or {})
+        for fact in (r.get("upd_memory") or []):
+            if fact not in merged_memory:
+                merged_memory.append(fact)
 
     # Primo pending_call trovato (priorità: prima operazione che richiede input)
     pending_list = [
@@ -47,15 +51,33 @@ def merge_node(state: AgentState) -> dict:
     non_empty     = [r for r in responses if r.text.strip()]
     lists         = [r for r in responses if r.sections or r.items]
 
-    if len(lists) > 1:
-        # Sequenziale: mostra solo la PRIMA disambiguazione.
-        # Le altre restano come pending_call e verranno riproposte al turno successivo.
-        first = lists[0]
+    if len(pending_list) > 1:
+        # BATCH: più disambiguazioni → testo unico, NO lista interattiva.
+        # Evita round-trip multipli con l'LLM: l'utente risponde a tutto in un colpo.
+        blocks = []
+        needs_qty = False
+        for r in results:
+            if r.get("needs_input") and r.get("pending_call"):
+                resp = FinalResponse(**r["response"])
+                blocks.append(resp.text)
+                if r["pending_call"].get("args", {}).get("quantity") is None:
+                    needs_qty = True
+
+        combined = "Ho bisogno di qualche precisazione:\n\n" + "\n\n".join(blocks)
+        if needs_qty:
+            combined += "\n\nSpecifica anche la quantità per ciascun prodotto."
+        combined += "\n\nRispondi con le tue scelte."
+
+        final = FinalResponse(text=combined, use_interactive_list=False)
+    elif len(lists) > 1:
+        # Fallback: più liste interattive ma un solo pending
+        last_list = lists[-1]
+        combined_text = "\n\n".join(r.text for r in non_empty)
         final = FinalResponse(
-            text=first.text + "\n\n_Seguirà un'altra selezione._",
+            text=combined_text,
             use_interactive_list=True,
-            sections=first.sections or [],
-            items=first.items or [],
+            sections=last_list.sections or [],
+            items=last_list.items or [],
         )
     elif len(responses) == 1 and not has_cart_view:
         final = responses[0]
@@ -68,11 +90,6 @@ def merge_node(state: AgentState) -> dict:
             items=last_list.items    if last_list else [],
             sections=last_list.sections if last_list else [],
         )
-
-    # Nota UX: se ci sono più pending che liste mostrate, avvisa l'utente
-    if isinstance(new_pending, list) and len(new_pending) > 1 and final.use_interactive_list:
-        if "_Seguirà un'altra selezione._" not in final.text:
-            final.text = final.text.rstrip() + "\n\n_Seguirà un'altra selezione._"
 
     # --- Cart view post-mutation ---
     # Raccoglie client_id unici che hanno avuto una mutation (add/remove)
@@ -89,7 +106,8 @@ def merge_node(state: AgentState) -> dict:
                       (merged_clients.get(cid) or {}).get("alias") or cid
             cart    = _db_manage_cart(agent_code, "view", cid) or []
             cart_text = _cart_text(cart if isinstance(cart, list) else [], cname)
-            suffix  = "\n\nVuoi confermare e inviare l'ordine?" if isinstance(cart, list) and cart else ""
+            has_pending = new_pending is not None
+            suffix  = "\n\nVuoi confermare e inviare l'ordine?" if isinstance(cart, list) and cart and not has_pending else ""
             cart_parts.append(f"{cart_text}{suffix}")
 
         cart_section = "\n\n".join(cart_parts)
@@ -119,4 +137,5 @@ def merge_node(state: AgentState) -> dict:
         "pending_call":   new_pending,
         "known_clients":  merged_clients,
         "known_products": merged_products,
+        "session_memory": merged_memory,
     }

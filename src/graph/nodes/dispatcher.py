@@ -19,6 +19,7 @@ from src.graph.shared import (
     brand_values,
     categoria_values,
     sottocategoria_values,
+    citta_values,
 )
 
 _HISTORY_WINDOW = int(os.getenv("CHAT_HISTORY_WINDOW", "10"))
@@ -37,6 +38,10 @@ def dispatcher_node(state: AgentState) -> dict:
         f" ({info.get('citta', '')})"
         for cid, info in list(known_clients.items())[:20]
     ) or "  (nessuno risolto in questa sessione)"
+
+    # Memoria sessione (alias, preferenze, modi di dire appresi)
+    memory = state.get("session_memory") or []
+    memory_str = "\n".join(f"  • {m}" for m in memory[-20:]) if memory else "  (nessuna)"
 
     # Contesto operazioni in sospeso (supporta 1 o più pending_call)
     raw_pending   = state.get("pending_call")
@@ -85,12 +90,16 @@ def dispatcher_node(state: AgentState) -> dict:
         f"  Categorie:      {', '.join(categoria_values)}\n"
         f"  Sottocategorie: {', '.join(sottocategoria_values)}\n"
         f"Usa questi valori esatti in filters_json quando l'utente filtra per brand o categoria.\n"
+        f"\nANAGRAFICA CLIENTI — CITTÀ DISPONIBILI:\n"
+        f"  {', '.join(citta_values)}\n"
+        f"Quando l'utente menziona una città, usa city_filter in list_clients.\n"
     )
 
     system_prompt = (
         f"Sei l'assistente vendite Horeca per {agent_nome or agent_code}.\n"
         f"Data e ora: {state.get('current_datetime') or ''}\n\n"
-        f"CLIENTI RISOLTI IN SESSIONE:\n{clients_str}"
+        f"CLIENTI RISOLTI IN SESSIONE:\n{clients_str}\n\n"
+        f"MEMORIA SESSIONE (alias e preferenze appresi):\n{memory_str}"
         f"{catalog_ctx}"
         f"{pending_ctx}\n\n"
         f"ISTRUZIONI:\n"
@@ -126,7 +135,15 @@ def dispatcher_node(state: AgentState) -> dict:
         f"  Se c'è un filtro ('brand DI BIRRA', 'clienti DI MILANO') usa SEMPRE query_database.\n"
         f"- Per il primo messaggio usa free_response con un breve benvenuto a "
         f"{agent_nome or agent_code}.\n"
-        f"- Per richieste fuori ambito usa free_response."
+        f"- Per richieste fuori ambito usa free_response.\n"
+        f"- Se l'utente menziona una città per un cliente (es. 'Bar Mario di Torino', "
+        f"'il cliente di Como'), popola city_hint con la città per disambiguare omonimi.\n"
+        f"- Chiama remember INSIEME al tool principale quando l'utente corregge un nome/alias "
+        f"(es. 'intendevo Mario Rossi' dopo aver detto 'marione') o specifica una preferenza "
+        f"ricorrente (es. 'per Ichnusa intendo sempre la non filtrata 33cl').\n"
+        f"  Il fatto deve essere conciso e strutturato: 'Marione = Mario Rossi di Milano (C001)'.\n"
+        f"  NON chiamare remember per informazioni già presenti nei CLIENTI RISOLTI o nella MEMORIA SESSIONE.\n"
+        f"  Consulta la MEMORIA SESSIONE prima di disambiguare: se un alias è già memorizzato, usalo direttamente."
     )
 
     llm = get_model("generic").bind_tools(DISPATCHER_TOOLS)
@@ -151,7 +168,9 @@ def dispatcher_node(state: AgentState) -> dict:
         }
 
     tool_calls = list(ai_resp.tool_calls)   # list of dicts: {name, args, id, type}
-    print(f"   🔧 Tool calls: {[tc['name'] for tc in tool_calls]}")
+    for tc in tool_calls:
+        args_str = ", ".join(f"{k}={v!r}" for k, v in tc["args"].items() if v is not None)
+        print(f"   🔧 {tc['name']}({args_str})")
 
     return {
         "tool_calls": tool_calls,
